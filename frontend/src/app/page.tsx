@@ -99,12 +99,12 @@ export default function LandingPage() {
               Create a workspace, or join your team&apos;s
             </h2>
             <p className="mx-auto mt-3 max-w-xl text-muted-foreground">
-              Sign in with Google and you&apos;re one screen away — start fresh, or enter the
+              Create an account and you&apos;re one screen away — start fresh, or enter the
               workspace ID a teammate sent you.
             </p>
             <Button asChild size="lg" className="mt-8">
               <Link href="/login">
-                Continue with Google <ArrowRight className="h-4 w-4" />
+                Get started <ArrowRight className="h-4 w-4" />
               </Link>
             </Button>
           </div>

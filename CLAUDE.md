@@ -22,7 +22,7 @@ Don't add infrastructure for problems the project doesn't have yet.
 ## Architecture, and the three rules that hold it together
 
 ```
-browser ──Supabase Auth (Google)──▶ JWT
+browser ──Supabase Auth (email + password)──▶ JWT
 browser ──REST + WebSocket────────▶ Go API ──PostgREST──▶ Supabase Postgres
 ```
 

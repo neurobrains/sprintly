@@ -85,7 +85,7 @@ export default function MembersPage() {
             <CardHeader>
               <CardTitle className="text-base">Invite your team</CardTitle>
               <CardDescription>
-                Share this code. Teammates sign in with Google, choose &ldquo;Join existing&rdquo;
+                Share this code. Teammates create an account, choose &ldquo;Join existing&rdquo;
                 and paste it.
               </CardDescription>
             </CardHeader>

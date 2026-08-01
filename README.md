@@ -3,7 +3,7 @@
 **One workspace for the whole team.** Boards, docs, discussion, time tracking
 and workload — together, so work stops scattering across five tools.
 
-Go API · Next.js 15 · Supabase (Postgres + Auth) · Google sign-in
+Go API · Next.js 15 · Supabase (Postgres + Auth) · email + password sign-in
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Go](https://img.shields.io/badge/go-1.24-00ADD8?logo=go&logoColor=white)](backend/go.mod)
@@ -16,7 +16,7 @@ Go API · Next.js 15 · Supabase (Postgres + Auth) · Google sign-in
 ```
 frontend/  Next.js 15 · TypeScript · Tailwind · TanStack Query
      │
-     ├── Supabase Auth ──────── Google sign-in only. Returns a JWT.
+     ├── Supabase Auth ──────── email + password. Returns a JWT.
      │                          The browser never reads a table.
      │
      └── REST + WebSocket ──▶ backend/  Go 1.24 · chi
@@ -28,8 +28,8 @@ frontend/  Next.js 15 · TypeScript · Tailwind · TanStack Query
 ```
 
 **Every byte of data goes through the Go API.** The browser holds the Supabase
-URL and anon key purely to complete the Google OAuth handshake and hold a
-session; it has no data path to Postgres. Authorization lives in one place —
+URL and anon key purely to sign in and hold a session; it has no data path to
+Postgres. Authorization lives in one place —
 `requireWorkspace` and `requireRole` in `handlers/server.go`.
 
 **The API talks PostgREST, not Postgres.** The deployment holds the project URL,
@@ -51,10 +51,11 @@ Needs Go 1.24+, Node 22+, and a Supabase project.
 **1. Database.** Paste [`supabase/schema.sql`](supabase/schema.sql) into the
 Supabase SQL Editor and run it. Safe to re-run.
 
-**2. Google sign-in.** OAuth client with redirect
-`https://<ref>.supabase.co/auth/v1/callback` → paste ID and secret into
-*Authentication → Providers → Google* → add `http://localhost:3000/auth/callback`
-to *URL Configuration → Redirect URLs*.
+**2. Auth.** *Authentication → Providers → Email* is on by default; nothing to
+configure. For local development turn **Confirm email** off so a signup logs you
+straight in — leave it **on** anywhere reachable from the internet, or anyone can
+register an address they don't own. Set *URL Configuration → Site URL* to
+`http://localhost:3000`.
 
 **3. Env.** One `.env` at the repository root drives the API:
 

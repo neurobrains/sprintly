@@ -45,7 +45,7 @@ body:
         - Frontend (Next.js)
         - Backend API (Go)
         - Database / schema
-        - Auth / Google sign-in
+        - Auth / sign-in
         - Realtime / WebSocket
         - Deployment (Docker, Cloud Run)
         - Not sure

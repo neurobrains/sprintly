@@ -30,7 +30,7 @@ type User struct {
 	Email     string    `json:"email"`
 	Name      string    `json:"name,omitempty"`
 	AvatarURL string    `json:"avatar_url,omitempty"`
-	Provider  string    `json:"provider,omitempty"` // "google" for Google sign-in
+	Provider  string    `json:"provider,omitempty"` // "email" for password sign-in
 }
 
 // Membership is the caller's standing in the workspace addressed by the route.

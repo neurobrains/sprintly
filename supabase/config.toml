@@ -32,17 +32,16 @@ enable_refresh_token_rotation = true
 refresh_token_reuse_interval = 10
 enable_signup = true
 
+# Email + password is the only sign-in method.
 [auth.email]
-enable_signup = false
+enable_signup = true
+# Off locally: the CLI's inbox is Inbucket on :54324, and having to fish a link
+# out of it on every test signup is friction with no security value on a
+# throwaway database. Turn it ON for any deployment reachable from the internet,
+# or anyone can register an address they do not own.
 enable_confirmations = false
-
-# Google is the only sign-in method. Export GOOGLE_CLIENT_ID and
-# GOOGLE_SECRET before `supabase start`.
-[auth.external.google]
-enabled = true
-client_id = "env(GOOGLE_CLIENT_ID)"
-secret = "env(GOOGLE_SECRET)"
-redirect_uri = "http://localhost:54321/auth/v1/callback"
+double_confirm_changes = true
+min_password_length = 8
 
 [realtime]
 enabled = true

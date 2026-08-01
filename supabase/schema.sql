@@ -128,8 +128,8 @@ create table if not exists profiles (
 
 create index if not exists profiles_email_idx on profiles (lower(email));
 
--- Populate a profile the moment Supabase Auth creates the user (Google OAuth
--- puts the display name + picture in raw_user_meta_data).
+-- Populate a profile the moment Supabase Auth creates the user (sign-up
+-- puts the full_name it was given into raw_user_meta_data).
 create or replace function handle_new_auth_user() returns trigger
 language plpgsql security definer set search_path = public as $$
 begin
@@ -1305,7 +1305,7 @@ end $fn$;
 -- ---------------------------------------------------------------- profiles
 
 -- Conditional merge: the JWT refreshes the email and fills in blanks, but a
--- full_name the user has since edited wins over the one Google supplies.
+-- full_name the user has since edited wins over the one captured at sign-up.
 create or replace function upsert_profile(
   p_id uuid, p_email text, p_name text default null, p_avatar text default null
 ) returns setof profiles
