@@ -1,0 +1,87 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 222 47% 11%;
+    --card: 0 0% 100%;
+    --card-foreground: 222 47% 11%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 222 47% 11%;
+    --primary: 243 75% 59%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 220 14% 96%;
+    --secondary-foreground: 222 47% 11%;
+    --muted: 220 14% 96%;
+    --muted-foreground: 220 9% 46%;
+    --accent: 220 14% 96%;
+    --accent-foreground: 222 47% 11%;
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 220 13% 91%;
+    --input: 220 13% 91%;
+    --ring: 243 75% 59%;
+    --radius: 0.65rem;
+  }
+
+  .dark {
+    --background: 224 47% 7%;
+    --foreground: 210 40% 98%;
+    --card: 223 43% 10%;
+    --card-foreground: 210 40% 98%;
+    --popover: 223 43% 10%;
+    --popover-foreground: 210 40% 98%;
+    --primary: 243 75% 68%;
+    --primary-foreground: 224 47% 7%;
+    --secondary: 223 30% 16%;
+    --secondary-foreground: 210 40% 98%;
+    --muted: 223 30% 16%;
+    --muted-foreground: 218 15% 65%;
+    --accent: 223 30% 18%;
+    --accent-foreground: 210 40% 98%;
+    --destructive: 0 63% 50%;
+    --destructive-foreground: 210 40% 98%;
+    --border: 223 30% 18%;
+    --input: 223 30% 20%;
+    --ring: 243 75% 68%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-feature-settings: "cv11", "ss01";
+  }
+}
+
+@layer utilities {
+  /* Board columns scroll independently; keep the scrollbar unobtrusive. */
+  .scrollbar-thin {
+    scrollbar-width: thin;
+    scrollbar-color: hsl(var(--border)) transparent;
+  }
+  .scrollbar-thin::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  .scrollbar-thin::-webkit-scrollbar-thumb {
+    background-color: hsl(var(--border));
+    border-radius: 9999px;
+  }
+  .scrollbar-thin::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  /* Subtle mesh used behind the auth and onboarding screens. */
+  .mesh-bg {
+    background-image:
+      radial-gradient(at 18% 12%, hsl(243 75% 59% / 0.16) 0px, transparent 55%),
+      radial-gradient(at 82% 22%, hsl(280 70% 60% / 0.13) 0px, transparent 50%),
+      radial-gradient(at 45% 88%, hsl(200 85% 55% / 0.12) 0px, transparent 55%);
+  }
+}

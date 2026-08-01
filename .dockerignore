@@ -1,0 +1,50 @@
+# Everything here is excluded from the build context uploaded to Cloud Build /
+# the Docker daemon. The root Dockerfile only builds the Go API, so the biggest
+# win is dropping frontend/ — node_modules and .next alone are hundreds of MB,
+# and including them would also bust the layer cache on every frontend commit.
+
+# ----------------------------------------------------------------- frontend
+frontend/
+
+# ----------------------------------------------------------------- database
+# Applied to Supabase out of band, never baked into the image.
+supabase/
+
+# ----------------------------------------------------------------- vcs & ci
+.git/
+.gitignore
+.github/
+.gitattributes
+
+# ----------------------------------------------------------------- docs
+docs/
+*.md
+LICENSE
+
+# ----------------------------------------------------------------- local dev
+.env
+.env.*
+!.env.example
+docker-compose.yml
+docker-compose.*.yml
+Makefile
+.editorconfig
+
+# ----------------------------------------------------------------- build output
+backend/server
+backend/server.exe
+backend/dist/
+backend/bin/
+
+# ----------------------------------------------------------------- editors & os
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+
+# ----------------------------------------------------------------- misc
+*.log
+*.pem
+.dockerignore
+Dockerfile.dev

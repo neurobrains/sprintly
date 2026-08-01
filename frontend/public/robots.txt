@@ -1,0 +1,8 @@
+User-agent: *
+Allow: /$
+Allow: /login
+# Workspace content is private; keep it out of indexes.
+Disallow: /w/
+Disallow: /app
+Disallow: /onboarding
+Disallow: /auth/

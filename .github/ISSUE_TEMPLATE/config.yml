@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question or idea
+    url: https://github.com/neurobrains/sprintly/discussions
+    about: Setup help, design discussion, or anything not yet a concrete bug.
+  - name: Report a security vulnerability
+    url: https://github.com/neurobrains/sprintly/security/advisories/new
+    about: Please report privately, never as a public issue. See SECURITY.md.

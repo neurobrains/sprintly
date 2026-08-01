@@ -1,0 +1,47 @@
+version: 2
+
+# Everything targets develop — main only moves by merging develop, so a
+# dependency bump landing directly on main would deploy without review.
+updates:
+  - package-ecosystem: gomod
+    directory: /backend
+    target-branch: develop
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore(deps)"
+    labels: [dependencies, backend]
+
+  - package-ecosystem: npm
+    directory: /frontend
+    target-branch: develop
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore(deps)"
+    labels: [dependencies, frontend]
+    groups:
+      # React/Next and the Radix primitives churn constantly and are only ever
+      # useful reviewed together.
+      react:
+        patterns: ["react", "react-dom", "@types/react*", "next", "eslint-config-next"]
+      radix:
+        patterns: ["@radix-ui/*"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    target-branch: develop
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "ci(deps)"
+    labels: [dependencies, ci]
+
+  - package-ecosystem: docker
+    directory: /
+    target-branch: develop
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "chore(deps)"
+    labels: [dependencies, docker]

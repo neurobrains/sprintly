@@ -1,0 +1,81 @@
+name: Bug report
+description: Something behaves differently than it should
+labels: [bug, needs-triage]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Security vulnerabilities do **not** belong here — please use a
+        [private advisory](https://github.com/neurobrains/sprintly/security/advisories/new).
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: And what you expected instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Sign in and open the board
+        2. Drag a card from Todo to In Progress
+        3. Refresh — the card is back in Todo
+    validations:
+      required: true
+
+  - type: textarea
+    id: error
+    attributes:
+      label: Error response or logs
+      description: >
+        The most useful single thing you can paste. Every API error is
+        `{ "code": "...", "message": "..." }` — the `code` is what identifies the
+        failure. Grab it from the browser's Network tab, or from the API logs.
+      render: json
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Where is it?
+      options:
+        - Frontend (Next.js)
+        - Backend API (Go)
+        - Database / schema
+        - Auth / Google sign-in
+        - Realtime / WebSocket
+        - Deployment (Docker, Cloud Run)
+        - Not sure
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Commit SHA or release tag.
+      placeholder: e.g. develop @ a1b2c3d
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      placeholder: |
+        OS:        macOS 15.3
+        Browser:   Chrome 132
+        Go:        go1.24.1
+        Node:      22.13.0
+        Running:   local / docker compose / Cloud Run
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and this isn't a duplicate
+          required: true
+        - label: I applied the current `supabase/schema.sql` to my database
+          required: false

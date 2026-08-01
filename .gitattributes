@@ -1,0 +1,22 @@
+# Normalise line endings in the repository. Development happens on Windows and
+# on Unix; CI runs the shell scripts inside workflows on Linux, where a CRLF
+# would break a heredoc terminator.
+* text=auto eol=lf
+
+*.go        text eol=lf
+*.sql       text eol=lf
+*.sh        text eol=lf
+Dockerfile  text eol=lf
+Makefile    text eol=lf
+
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# Generated — collapse in diffs and exclude from language statistics.
+package-lock.json linguist-generated=true -diff
+go.sum            linguist-generated=true -diff
+
+*.png binary
+*.jpg binary
+*.ico binary
+*.woff2 binary
