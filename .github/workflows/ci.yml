@@ -94,7 +94,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       # Builds exactly what Cloud Run will build, so a broken Dockerfile fails
       # here instead of halfway through a deploy. Not pushed anywhere.
