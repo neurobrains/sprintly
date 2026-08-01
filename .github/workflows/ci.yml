@@ -99,7 +99,7 @@ jobs:
       # Builds exactly what Cloud Run will build, so a broken Dockerfile fails
       # here instead of halfway through a deploy. Not pushed anywhere.
       - name: Build API image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: false
