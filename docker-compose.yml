@@ -3,8 +3,7 @@
 
 services:
   api:
-    # The root Dockerfile, not backend/Dockerfile — so `docker compose up` runs
-    # the same image Cloud Run builds and deploys.
+    # The root Dockerfile — the same image Cloud Run builds and deploys.
     build:
       context: .
       dockerfile: Dockerfile

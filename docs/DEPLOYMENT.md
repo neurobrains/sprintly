@@ -60,9 +60,11 @@ deployment from a repository** → **Set up with Cloud Build**.
 | Build type | **Dockerfile** | Not Buildpacks — the repo is a monorepo and buildpacks would guess wrong |
 | Dockerfile path | `/Dockerfile` | The root one, which builds only the Go API |
 
-That root [`Dockerfile`](../Dockerfile) exists *because* of this screen: Cloud
-Run's GitHub wiring only looks at the root of the build context and gives you no
-way to select `backend/Dockerfile`. [`.dockerignore`](../.dockerignore) strips
+The [`Dockerfile`](../Dockerfile) sits at the root *because* of this screen:
+Cloud Run's GitHub wiring only looks at the root of the build context and gives
+you no way to select one nested under `backend/`. It is the only Dockerfile for
+the API — a second copy would drift from the one that ships.
+[`.dockerignore`](../.dockerignore) strips
 `frontend/` and `supabase/` from the upload, so the context stays small and a
 frontend-only commit doesn't invalidate the build cache.
 

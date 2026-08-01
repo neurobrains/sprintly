@@ -10,8 +10,9 @@
 # uploaded context stays small and a frontend-only commit doesn't invalidate
 # the layer cache.
 #
-# backend/Dockerfile still exists for `docker build ./backend` from a checkout
-# of just that directory; the two produce the same binary.
+# This is the only Dockerfile for the API — there is deliberately not a second
+# one under backend/, because two copies of the same build drift apart and only
+# one of them is the copy that ships.
 #
 #   docker build -t sprintly-api .
 #   docker run --rm -p 8080:8080 --env-file .env sprintly-api
