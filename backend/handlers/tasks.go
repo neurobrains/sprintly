@@ -556,15 +556,18 @@ func (s *Server) notifyAssignment(ctx context.Context, wsID, actorID uuid.UUID,
 		return
 	}
 
+	// Through an RPC, not a plain insert: this writes a row owned by *another*
+	// user, which the notifications_own policy forbids whenever the API is
+	// running under RLS rather than as the service role.
+	//
 	// A missed notification must never fail the write that caused it.
-	_ = s.data.From("notifications").Insert(ctx, map[string]any{
-		"workspace_id": wsID,
-		"user_id":      *t.AssigneeID,
-		"actor_id":     actorID,
-		"kind":         "assignment",
-		"title":        "You were assigned " + t.Ref,
-		"body":         t.Title,
-		"task_id":      t.ID,
+	_ = s.data.RPC(ctx, "notify_assignment", map[string]any{
+		"p_workspace": wsID,
+		"p_user":      *t.AssigneeID,
+		"p_actor":     actorID,
+		"p_title":     "You were assigned " + t.Ref,
+		"p_body":      t.Title,
+		"p_task":      t.ID,
 	}, nil)
 
 	s.hub.PublishTo(wsID, *t.AssigneeID, realtime.Event{

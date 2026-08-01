@@ -561,8 +561,11 @@ create index if not exists notifications_inbox_idx
   on notifications (user_id, created_at desc) where read_at is null;
 
 -- Fan out @mentions on a task comment into the notification inbox.
+-- SECURITY DEFINER because it inserts notifications for *other* users, which
+-- the notifications_own policy forbids to the invoking role. Without this the
+-- trigger silently drops every mention when the API runs under RLS.
 create or replace function comments_fanout_mentions() returns trigger
-language plpgsql as $$
+language plpgsql security definer set search_path = public as $$
 begin
   insert into notifications (workspace_id, user_id, actor_id, kind, title, body, task_id, doc_id)
   select new.workspace_id, m, new.author_id, 'mention',
@@ -1250,6 +1253,55 @@ end $$;
 -- argument. They do NOT check authorization — the Go API already did that in
 -- requireWorkspace/requireRole. They are revoked from the browser roles below.
 
+
+-- ---------------------------------------------------------------- access guards
+--
+-- These make section 8 safe to expose to the `authenticated` role, which is
+-- required when the API runs without a service key (it then forwards the
+-- caller's own token and PostgREST executes as that user).
+--
+-- auth.uid() is NULL for a service-role call: the Go API already ran
+-- requireWorkspace/requireRole, so the guard passes through. When a real user
+-- token is present — including a browser calling PostgREST directly with the
+-- public anon key — membership is checked here.
+
+create or replace function can_act_as(p_user uuid) returns boolean
+language sql stable security definer set search_path = public as $fn$
+  select auth.uid() is null or auth.uid() = p_user
+$fn$;
+
+create or replace function can_access_workspace(p_workspace uuid) returns boolean
+language sql stable security definer set search_path = public as $fn$
+  select auth.uid() is null
+      or exists (select 1 from workspace_members
+                  where workspace_id = p_workspace
+                    and user_id = auth.uid() and status = 'active')
+$fn$;
+
+create or replace function can_manage_ws(p_workspace uuid) returns boolean
+language sql stable security definer set search_path = public as $fn$
+  select auth.uid() is null
+      or exists (select 1 from workspace_members
+                  where workspace_id = p_workspace and user_id = auth.uid()
+                    and status = 'active' and role in ('owner','admin','manager'))
+$fn$;
+
+create or replace function assert_workspace_access(p_workspace uuid) returns void
+language plpgsql stable security definer set search_path = public as $fn$
+begin
+  if not can_access_workspace(p_workspace) then
+    raise exception 'not a member of this workspace' using errcode = 'insufficient_privilege';
+  end if;
+end $fn$;
+
+create or replace function assert_workspace_manage(p_workspace uuid) returns void
+language plpgsql stable security definer set search_path = public as $fn$
+begin
+  if not can_manage_ws(p_workspace) then
+    raise exception 'requires the manager role or higher' using errcode = 'insufficient_privilege';
+  end if;
+end $fn$;
+
 -- ---------------------------------------------------------------- profiles
 
 -- Conditional merge: the JWT refreshes the email and fills in blanks, but a
@@ -1259,6 +1311,10 @@ create or replace function upsert_profile(
 ) returns setof profiles
 language plpgsql security definer set search_path = public as $fn$
 begin
+  if not can_act_as(p_id) then
+    raise exception 'cannot write another user''s profile' using errcode = 'insufficient_privilege';
+  end if;
+
   return query
   insert into profiles (id, email, full_name, avatar_url)
   values (p_id, coalesce(p_email, ''), nullif(btrim(coalesce(p_name, '')), ''),
@@ -1291,6 +1347,7 @@ language sql stable security definer set search_path = public as $fn$
     from workspaces w
     join workspace_members m on m.workspace_id = w.id
    where m.user_id = p_user and m.status = 'active'
+     and can_act_as(p_user)
    order by w.created_at
 $fn$;
 
@@ -1311,6 +1368,7 @@ language sql stable security definer set search_path = public as $fn$
     join workspace_members m
       on m.workspace_id = t.workspace_id and m.user_id = p_user and m.status = 'active'
    where t.assignee_id = p_user and t.state not in ('done','cancelled')
+     and can_act_as(p_user)
    order by t.due_date nulls last,
             array_position(array['urgent','high','medium','low','none'], t.priority::text),
             t.created_at
@@ -1351,6 +1409,8 @@ create or replace function rotate_join_code(p_workspace uuid) returns text
 language plpgsql security definer set search_path = public as $fn$
 declare code text;
 begin
+  perform assert_workspace_manage(p_workspace);
+
   update workspaces set join_code = gen_join_code(), updated_at = now()
    where id = p_workspace
   returning join_code into code;
@@ -1376,6 +1436,8 @@ create or replace function create_team(
 language plpgsql security definer set search_path = public as $fn$
 declare new_id uuid;
 begin
+  perform assert_workspace_manage(p_workspace);
+
   insert into teams (workspace_id, name, description, color)
   values (p_workspace, p_name, p_description, p_color)
   returning teams.id into new_id;
@@ -1432,7 +1494,9 @@ left join profiles a on a.id = t.assignee_id;
 create or replace function task_detail(p_workspace uuid, p_task uuid)
 returns setof task_row
 language sql stable security definer set search_path = public as $fn$
-  select * from task_row where workspace_id = p_workspace and id = p_task
+  select * from task_row
+   where workspace_id = p_workspace and id = p_task
+     and can_access_workspace(p_workspace)
 $fn$;
 
 -- Every filter is optional; a null argument drops out of the WHERE clause.
@@ -1455,6 +1519,7 @@ language sql stable security definer set search_path = public as $fn$
   select *
     from task_row t
    where t.workspace_id = p_workspace
+     and can_access_workspace(p_workspace)
      and (p_project    is null or t.project_id  = p_project)
      and (p_assignee   is null or t.assignee_id = p_assignee)
      and (not p_unassigned     or t.assignee_id is null)
@@ -1484,6 +1549,8 @@ create or replace function create_task(
 language plpgsql security definer set search_path = public as $fn$
 declare new_id uuid;
 begin
+  perform assert_workspace_access(p_workspace);
+
   -- Scopes the project to the caller's workspace. Without it a project uuid
   -- from another tenant would be accepted.
   if not exists (select 1 from projects p
@@ -1516,6 +1583,8 @@ create or replace function set_task_labels(
 ) returns void
 language plpgsql security definer set search_path = public as $fn$
 begin
+  perform assert_workspace_access(p_workspace);
+
   delete from task_labels where task_id = p_task;
 
   if p_labels is null or cardinality(p_labels) = 0 then
@@ -1546,16 +1615,50 @@ language sql stable security definer set search_path = public as $fn$
       on other.id = case when d.target_id = p_task then d.source_id else d.target_id end
     join projects op on op.id = other.project_id
    where d.workspace_id = p_workspace
+     and can_access_workspace(p_workspace)
      and (d.source_id = p_task or d.target_id = p_task)
    order by d.created_at
 $fn$;
 
+-- ---------------------------------------------------------------- notifications
+
+-- notify_assignment writes a notification for *someone else*, which the
+-- notifications_own policy forbids to the invoking role. The Go API inserts
+-- these directly when it holds a service key; without one it must come through
+-- here or every assignment notification is silently dropped.
+create or replace function notify_assignment(
+  p_workspace uuid, p_user uuid, p_actor uuid,
+  p_title text, p_body text, p_task uuid
+) returns void
+language plpgsql security definer set search_path = public as $fn$
+begin
+  perform assert_workspace_access(p_workspace);
+
+  -- Only notify someone who is actually in the workspace.
+  if not exists (select 1 from workspace_members
+                  where workspace_id = p_workspace and user_id = p_user
+                    and status = 'active') then
+    return;
+  end if;
+
+  insert into notifications (workspace_id, user_id, actor_id, kind, title, body, task_id)
+  values (p_workspace, p_user, p_actor, 'assignment', p_title, p_body, p_task);
+end $fn$;
+
 -- ---------------------------------------------------------------- exposure
 --
--- Everything above runs under the service role key, which bypasses RLS and is
--- never sent to a browser. PostgREST would otherwise publish every function in
--- the public schema, so the browser-facing roles are revoked explicitly — these
--- are SECURITY DEFINER and check no authorization of their own.
+-- PostgREST publishes every function in the public schema, so exposure is set
+-- explicitly rather than left to the default.
+--
+-- `authenticated` gets EXECUTE because the API can be configured without a
+-- service key, in which case it forwards the caller's own token and reaches
+-- PostgREST as this role. That also means a browser holding the public anon key
+-- can call these directly — which is safe only because each one runs the
+-- can_act_as / can_access_workspace / can_manage_ws guard above. Do not add a
+-- function to this list without one.
+--
+-- `anon` gets nothing: an unauthenticated caller has no workspace to be a
+-- member of, so every guard would reject it anyway.
 do $grant$
 declare fn text;
 begin
@@ -1563,15 +1666,26 @@ begin
     'upsert_profile','my_workspaces','my_tasks','lookup_workspace',
     'rotate_join_code','create_team','task_detail','task_list',
     'create_task','set_task_labels','task_dependency_list',
-    'create_workspace','join_workspace','decide_join_request','move_task'
+    'notify_assignment','create_workspace','join_workspace',
+    'decide_join_request','move_task'
   ] loop
     begin
       execute format('revoke all on function %I from anon, authenticated', fn);
+      execute format('grant execute on function %I to authenticated', fn);
     exception when others then
       null; -- absent role or overload mismatch: not fatal
     end;
   end loop;
 end $grant$;
+
+-- lookup_workspace is the pre-join preview: it is reachable before you are a
+-- member of anything, so it is the one function anon may call.
+do $anon$
+begin
+  execute 'grant execute on function lookup_workspace to anon';
+exception when others then
+  null;
+end $anon$;
 
 -- task_row is reachable through PostgREST as a table. It carries no
 -- workspace filter of its own, so it must not be readable by a browser session.

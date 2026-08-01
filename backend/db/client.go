@@ -35,16 +35,70 @@ import (
 // Client is safe for concurrent use.
 type Client struct {
 	rest string // https://<ref>.supabase.co/rest/v1
-	key  string // service role key
+	key  string // apikey header: service role key, or anon key in delegated mode
+
+	// delegated forwards the caller's own access token as the Authorization
+	// bearer instead of the service key, so PostgREST runs statements as that
+	// user and RLS applies. See WithToken.
+	delegated bool
+
 	http *http.Client
 }
 
+// New builds a client that authenticates as the service role. The key bypasses
+// RLS, so the Go API remains the only authorization boundary.
 func New(supabaseURL, serviceKey string) *Client {
 	return &Client{
 		rest: strings.TrimRight(supabaseURL, "/") + "/rest/v1",
 		key:  serviceKey,
 		http: &http.Client{Timeout: 20 * time.Second},
 	}
+}
+
+// NewDelegated builds a client for deployments with no service key. Every
+// request carries the anon key as `apikey` and the caller's access token as the
+// bearer, which makes PostgREST execute as that user under RLS.
+//
+// The trade-off is real: authorization stops being solely the Go API's job and
+// becomes a joint responsibility with the policies in schema.sql section 6. A
+// request whose context carries no token reaches PostgREST as the anon role and
+// sees nothing, which fails closed.
+func NewDelegated(supabaseURL, anonKey string) *Client {
+	c := New(supabaseURL, anonKey)
+	c.delegated = true
+	return c
+}
+
+// Delegated reports whether this client forwards caller tokens.
+func (c *Client) Delegated() bool { return c.delegated }
+
+type ctxKey int
+
+const ctxToken ctxKey = iota
+
+// WithToken stashes the caller's raw access token for the data layer to
+// forward. The auth middleware calls it on every authenticated request; it is a
+// no-op for a service-key client.
+func WithToken(ctx context.Context, raw string) context.Context {
+	if raw == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, ctxToken, raw)
+}
+
+func tokenFrom(ctx context.Context) string {
+	raw, _ := ctx.Value(ctxToken).(string)
+	return raw
+}
+
+// bearer picks the Authorization value for this request.
+func (c *Client) bearer(ctx context.Context) string {
+	if c.delegated {
+		if raw := tokenFrom(ctx); raw != "" {
+			return raw
+		}
+	}
+	return c.key
 }
 
 // Ping is the liveness probe. It asks PostgREST for zero rows of a table that
@@ -236,7 +290,7 @@ func (q *Query) do(ctx context.Context, method string, body, dest any) error {
 	}
 
 	req.Header.Set("apikey", q.c.key)
-	req.Header.Set("Authorization", "Bearer "+q.c.key)
+	req.Header.Set("Authorization", "Bearer "+q.c.bearer(ctx))
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}

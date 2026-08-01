@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/sprintly/sprintly/backend/config"
+	"github.com/sprintly/sprintly/backend/db"
 	"github.com/sprintly/sprintly/backend/httpx"
 )
 
@@ -153,7 +154,12 @@ func (v *Verifier) Required(next http.Handler) http.Handler {
 			httpx.Fail(w, r, err)
 			return
 		}
-		next.ServeHTTP(w, r.WithContext(WithUser(r.Context(), user)))
+
+		// The token travels on the context so the data layer can forward it to
+		// PostgREST when no service key is configured. A service-key client
+		// ignores it.
+		ctx := db.WithToken(WithUser(r.Context(), user), raw)
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 

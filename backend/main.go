@@ -35,7 +35,16 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	data := db.New(cfg.SupabaseURL, cfg.SupabaseServiceKey)
+	var data *db.Client
+	if cfg.DelegatedAuth() {
+		// No service key: PostgREST runs as the caller, under RLS.
+		data = db.NewDelegated(cfg.SupabaseURL, cfg.SupabaseAnonKey)
+		slog.Warn("no service key configured — running in delegated mode; "+
+			"row level security is enforcing access, not just the API",
+			"hint", "set SUPABASE_SERVICE_ROLE_KEY to switch")
+	} else {
+		data = db.New(cfg.SupabaseURL, cfg.SupabaseServiceKey)
+	}
 
 	// Fail fast on a bad URL or key rather than serving 502s to every caller.
 	pingCtx, cancelPing := context.WithTimeout(ctx, 10*time.Second)

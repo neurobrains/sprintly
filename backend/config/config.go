@@ -4,6 +4,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -19,12 +20,18 @@ type Config struct {
 	// PostgREST data endpoint and the JWKS endpoint are derived from it.
 	SupabaseURL string
 
-	// SupabaseAnonKey is public and only here so the API can report it; the
-	// browser gets its own copy for sign-in.
+	// SupabaseAnonKey is public — it also ships in the browser bundle. When no
+	// service key is configured it becomes the API's PostgREST apikey, paired
+	// with the caller's own access token.
 	SupabaseAnonKey string
 
-	// SupabaseServiceKey is the service role key. It bypasses RLS — it is the
-	// credential the whole data layer runs on, and it must never reach a client.
+	// SupabaseServiceKey is the service role (or "secret") key. Optional.
+	//
+	// Set   -> the API authenticates to PostgREST as the service role, which
+	//          bypasses RLS. The Go API is then the only authorization boundary.
+	// Unset -> the API falls back to the anon key plus the caller's own access
+	//          token, so PostgREST runs every statement as that user and RLS
+	//          enforces access. See Config.DelegatedAuth.
 	SupabaseServiceKey string
 
 	SupabaseJWTSecret string // legacy HS256 secret; leave empty when JWKS applies
@@ -34,11 +41,11 @@ type Config struct {
 	ShutdownGrace  time.Duration
 }
 
-// Load reads the repository-root .env (if present) then the process
-// environment. A missing .env is not an error — in production the values come
-// from the platform.
+// Load reads the nearest .env (if present) then the process environment. A
+// missing .env is not an error — in production the values come from the
+// platform.
 func Load() (*Config, error) {
-	_ = godotenv.Load(".env", "../.env")
+	loadDotEnv()
 
 	cfg := &Config{
 		Port:               env("PORT", "8080"),
@@ -55,10 +62,23 @@ func Load() (*Config, error) {
 	if cfg.SupabaseURL == "" {
 		return nil, fmt.Errorf("SUPABASE_URL is required (Supabase → Project Settings → API → Project URL)")
 	}
-	if cfg.SupabaseServiceKey == "" {
-		return nil, fmt.Errorf("SUPABASE_SERVICE_ROLE_KEY is required — it is the credential the data layer runs on (Project Settings → API → service_role)")
+	if cfg.SupabaseServiceKey == "" && cfg.SupabaseAnonKey == "" {
+		return nil, fmt.Errorf("set SUPABASE_SERVICE_ROLE_KEY, or SUPABASE_ANON_KEY to run in delegated mode (Project Settings → API)")
 	}
 	return cfg, nil
+}
+
+// DelegatedAuth reports whether the API forwards the caller's access token to
+// PostgREST instead of holding a service key. In that mode RLS — not the Go
+// middleware alone — decides what each request can reach.
+func (c *Config) DelegatedAuth() bool { return c.SupabaseServiceKey == "" }
+
+// APIKey is the value PostgREST wants in the apikey header.
+func (c *Config) APIKey() string {
+	if c.SupabaseServiceKey != "" {
+		return c.SupabaseServiceKey
+	}
+	return c.SupabaseAnonKey
 }
 
 // RESTURL is the PostgREST base the data layer talks to.
@@ -73,6 +93,34 @@ func (c *Config) JWKSURL() string {
 		return ""
 	}
 	return c.SupabaseURL + "/auth/v1/.well-known/jwks.json"
+}
+
+// loadDotEnv walks up from the working directory and loads the first .env it
+// finds, so `go run .` works from backend/ and from the repository root alike.
+//
+// It deliberately does not use godotenv.Load's variadic form: that returns on
+// the first filename that does not exist, so a missing backend/.env would stop
+// it ever reaching the repository root — which read as "SUPABASE_URL is
+// required" even though the file was sitting right there.
+func loadDotEnv() {
+	dir, err := os.Getwd()
+	if err != nil {
+		return
+	}
+	for range 4 { // backend/ -> repo root is one hop; three spare
+		candidate := filepath.Join(dir, ".env")
+		if _, err := os.Stat(candidate); err == nil {
+			// Values already in the real environment win, which is what
+			// godotenv does and what a container expects.
+			_ = godotenv.Load(candidate)
+			return
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return
+		}
+		dir = parent
+	}
 }
 
 // firstEnv returns the first of keys that is set, so the service key can be

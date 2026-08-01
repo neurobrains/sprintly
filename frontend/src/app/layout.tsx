@@ -25,7 +25,14 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
     // suppressHydrationWarning: next-themes sets `class` on <html> before React
     // hydrates, which would otherwise be reported as a mismatch.
     <html lang="en" suppressHydrationWarning>
-      <body>
+      {/*
+        Also on <body>: extensions that inject attributes before React hydrates
+        (Grammarly's data-gr-ext-installed / data-new-gr-c-s-check-loaded being
+        the common pair) produce a mismatch the app cannot prevent or fix. This
+        suppresses the warning for attributes on this element only — a genuine
+        mismatch in the tree below still reports normally.
+      */}
+      <body suppressHydrationWarning>
         <Providers>{children}</Providers>
         <Toaster position="bottom-right" richColors closeButton />
       </body>
