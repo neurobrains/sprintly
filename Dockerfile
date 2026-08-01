@@ -18,7 +18,7 @@
 #   docker run --rm -p 8080:8080 --env-file .env sprintly-api
 
 # ----------------------------------------------------------------- build
-FROM golang:1.24-alpine AS build
+FROM golang:1.26-alpine AS build
 WORKDIR /src
 
 # Manifests first, so the module cache survives source-only changes.
