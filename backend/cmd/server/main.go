@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -13,8 +14,8 @@ import (
 
 	"github.com/sprintly/sprintly/backend/internal/api"
 	"github.com/sprintly/sprintly/backend/internal/config"
-	"github.com/sprintly/sprintly/backend/internal/db"
 	"github.com/sprintly/sprintly/backend/internal/realtime"
+	"github.com/sprintly/sprintly/backend/internal/supa"
 )
 
 func main() {
@@ -34,16 +35,20 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	database, err := db.Connect(ctx, cfg.DatabaseURL)
+	data := supa.New(cfg.SupabaseURL, cfg.SupabaseServiceKey)
+
+	// Fail fast on a bad URL or key rather than serving 502s to every caller.
+	pingCtx, cancelPing := context.WithTimeout(ctx, 10*time.Second)
+	err = data.Ping(pingCtx)
+	cancelPing()
 	if err != nil {
-		return err
+		return fmt.Errorf("reach Supabase at %s: %w", cfg.RESTURL(), err)
 	}
-	defer database.Close()
 
 	hub := realtime.NewHub()
 	srv := &http.Server{
 		Addr:    ":" + cfg.Port,
-		Handler: api.NewServer(cfg, database, hub).Routes(),
+		Handler: api.NewServer(cfg, data, hub).Routes(),
 		// No WriteTimeout: it would sever long-lived WebSocket connections.
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,

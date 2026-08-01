@@ -3,7 +3,6 @@ package api
 
 import (
 	"context"
-	"errors"
 	"log/slog"
 	"net/http"
 	"time"
@@ -12,24 +11,27 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/cors"
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
 
 	"github.com/sprintly/sprintly/backend/internal/auth"
 	"github.com/sprintly/sprintly/backend/internal/config"
-	"github.com/sprintly/sprintly/backend/internal/db"
 	"github.com/sprintly/sprintly/backend/internal/httpx"
 	"github.com/sprintly/sprintly/backend/internal/realtime"
+	"github.com/sprintly/sprintly/backend/internal/supa"
 )
 
 type Server struct {
 	cfg      *config.Config
-	db       *db.DB
+	data     *supa.Client
 	verifier *auth.Verifier
 	hub      *realtime.Hub
 }
 
-func NewServer(cfg *config.Config, database *db.DB, hub *realtime.Hub) *Server {
-	return &Server{cfg: cfg, db: database, verifier: auth.NewVerifier(cfg), hub: hub}
+// supaQuery lets handlers pass a partly-built query around without every file
+// importing the supa package.
+type supaQuery = supa.Query
+
+func NewServer(cfg *config.Config, data *supa.Client, hub *realtime.Hub) *Server {
+	return &Server{cfg: cfg, data: data, verifier: auth.NewVerifier(cfg), hub: hub}
 }
 
 func (s *Server) Routes() http.Handler {
@@ -132,7 +134,7 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 
 	status := "ok"
 	code := http.StatusOK
-	if err := s.db.Ping(ctx); err != nil {
+	if err := s.data.Ping(ctx); err != nil {
 		status, code = "degraded", http.StatusServiceUnavailable
 	}
 	httpx.JSON(w, code, map[string]any{
@@ -157,37 +159,36 @@ func (s *Server) requireWorkspace(next http.Handler) http.Handler {
 		}
 
 		ref := chi.URLParam(r, "workspaceID")
-		var (
-			wsID   uuid.UUID
-			role   string
-			status string
-		)
 
-		query := `
-			select w.id, m.role, m.status
-			  from workspaces w
-			  join workspace_members m on m.workspace_id = w.id and m.user_id = $2
-			 where w.slug = $1`
-		args := []any{ref, user.ID}
+		// One round trip: read the caller's membership row and inner-join the
+		// workspace, filtering on whichever identifier they used.
+		var row struct {
+			Role      string `json:"role"`
+			Status    string `json:"status"`
+			Workspace struct {
+				ID uuid.UUID `json:"id"`
+			} `json:"workspaces"`
+		}
+
+		q := s.data.From("workspace_members").
+			Select("role,status,workspaces!inner(id)").
+			Eq("user_id", user.ID).
+			Single()
 
 		if parsed, parseErr := uuid.Parse(ref); parseErr == nil {
-			query = `
-				select w.id, m.role, m.status
-				  from workspaces w
-				  join workspace_members m on m.workspace_id = w.id and m.user_id = $2
-				 where w.id = $1`
-			args = []any{parsed, user.ID}
+			q = q.Eq("workspace_id", parsed)
+		} else {
+			q = q.Eq("workspaces.slug", ref)
 		}
 
-		err = s.db.QueryRow(r.Context(), query, args...).Scan(&wsID, &role, &status)
-		if errors.Is(err, pgx.ErrNoRows) {
-			httpx.Fail(w, r, httpx.ErrNotFound)
+		if err := q.Get(r.Context(), &row); err != nil {
+			// Not a member reads as "does not exist", so this cannot be used to
+			// probe which workspaces are out there.
+			httpx.Fail(w, r, err)
 			return
 		}
-		if err != nil {
-			httpx.Fail(w, r, db.MapError(err))
-			return
-		}
+
+		wsID, role, status := row.Workspace.ID, row.Role, row.Status
 		if status != "active" {
 			httpx.Fail(w, r, httpx.Errorf(http.StatusForbidden, "membership_"+status,
 				"Your membership in this workspace is %s", status))

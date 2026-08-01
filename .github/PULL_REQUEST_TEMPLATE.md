@@ -32,7 +32,7 @@ Anything worth flagging. In particular:
   twice in a row still succeeds.
 - Destructive schema changes (dropped/renamed columns) — these cannot be made
   idempotent. Say so explicitly.
-- New environment variables — they also need adding to .env.example and to
-  docs/DEPLOYMENT.md.
+- New environment variables — they also need adding to .env.example and to the
+  Deployment section of the README.
 - New API error `code` values — the frontend switches on these.
 -->

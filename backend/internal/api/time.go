@@ -1,29 +1,47 @@
 package api
 
 import (
+	"context"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 
-	"github.com/sprintly/sprintly/backend/internal/db"
 	"github.com/sprintly/sprintly/backend/internal/httpx"
 	"github.com/sprintly/sprintly/backend/internal/models"
 	"github.com/sprintly/sprintly/backend/internal/realtime"
 )
 
-const timeEntrySelect = `
-	select e.id, e.task_id, t.title, e.user_id, e.description,
-	       e.started_at, e.ended_at, e.duration_seconds, e.is_billable
-	  from time_entries e
-	  left join tasks t on t.id = e.task_id`
+// timeEntryCols embeds the task title through the task_id foreign key, which is
+// the one join this resource needs.
+const timeEntryCols = "id,task_id,user_id,description,started_at,ended_at," +
+	"duration_seconds,is_billable,tasks(title)"
 
-func scanTimeEntry(row interface{ Scan(...any) error }) (models.TimeEntry, error) {
-	var e models.TimeEntry
-	err := row.Scan(&e.ID, &e.TaskID, &e.TaskTitle, &e.UserID, &e.Description,
-		&e.StartedAt, &e.EndedAt, &e.DurationSeconds, &e.IsBillable)
-	return e, err
+// timeEntryRow is the wire shape PostgREST returns: models.TimeEntry plus the
+// embedded task object, which is flattened into TaskTitle.
+type timeEntryRow struct {
+	models.TimeEntry
+	Task *struct {
+		Title string `json:"title"`
+	} `json:"tasks"`
+}
+
+func (r timeEntryRow) entry() models.TimeEntry {
+	e := r.TimeEntry
+	if r.Task != nil {
+		title := r.Task.Title
+		e.TaskTitle = &title
+	}
+	return e
+}
+
+func flattenEntries(rows []timeEntryRow) []models.TimeEntry {
+	out := make([]models.TimeEntry, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, row.entry())
+	}
+	return out
 }
 
 // handleListTimeEntries defaults to the caller's own entries. Managers may pass
@@ -48,38 +66,32 @@ func (s *Server) handleListTimeEntries(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	rows, err := s.db.Query(r.Context(), timeEntrySelect+`
-		 where e.workspace_id = $1 and e.user_id = $2
-		   and ($3::timestamptz is null or e.started_at >= $3)
-		   and ($4::timestamptz is null or e.started_at < $4)
-		 order by e.started_at desc
-		 limit $5`,
-		wsID, target,
-		optionalString(r.URL.Query().Get("from")),
-		optionalString(r.URL.Query().Get("to")),
-		httpx.QueryInt(r, "limit", 100, 500))
-	if err != nil {
-		httpx.Fail(w, r, db.MapError(err))
+	q := s.data.From("time_entries").
+		Select(timeEntryCols).
+		Eq("workspace_id", wsID).
+		Eq("user_id", target).
+		Order("started_at", true).
+		Limit(httpx.QueryInt(r, "limit", 100, 500))
+
+	if from := strings.TrimSpace(r.URL.Query().Get("from")); from != "" {
+		q = q.Gte("started_at", from)
+	}
+	if to := strings.TrimSpace(r.URL.Query().Get("to")); to != "" {
+		q = q.Lt("started_at", to)
+	}
+
+	var rows []timeEntryRow
+	if err := q.Get(r.Context(), &rows); err != nil {
+		httpx.Fail(w, r, err)
 		return
 	}
-	defer rows.Close()
 
-	out := []models.TimeEntry{}
+	out := flattenEntries(rows)
 	total := 0
-	for rows.Next() {
-		e, err := scanTimeEntry(rows)
-		if err != nil {
-			httpx.Fail(w, r, db.MapError(err))
-			return
-		}
+	for _, e := range out {
 		if e.DurationSeconds != nil {
 			total += *e.DurationSeconds
 		}
-		out = append(out, e)
-	}
-	if err := rows.Err(); err != nil {
-		httpx.Fail(w, r, db.MapError(err))
-		return
 	}
 
 	httpx.JSON(w, http.StatusOK, map[string]any{
@@ -146,24 +158,46 @@ func (s *Server) handleLogTime(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	e, err := scanTimeEntry(s.db.QueryRow(r.Context(), `
-		with inserted as (
-		  insert into time_entries (workspace_id, task_id, user_id, description,
-		                            started_at, ended_at, is_billable)
-		  values ($1, nullif($2,'')::uuid, $3, nullif($4,''), $5, $6, $7)
-		  returning *
-		)
-		select e.id, e.task_id, t.title, e.user_id, e.description,
-		       e.started_at, e.ended_at, e.duration_seconds, e.is_billable
-		  from inserted e left join tasks t on t.id = e.task_id`,
-		wsID, derefString(req.TaskID), userID, derefString(req.Description),
-		started, ended, req.IsBillable))
+	e, err := s.insertTimeEntry(r.Context(), map[string]any{
+		"workspace_id": wsID,
+		"user_id":      userID,
+		"task_id":      nilIfEmpty(derefString(req.TaskID)),
+		"description":  nilIfEmpty(derefString(req.Description)),
+		"started_at":   started,
+		"ended_at":     ended,
+		"is_billable":  req.IsBillable,
+	})
 	if err != nil {
-		httpx.Fail(w, r, db.MapError(err))
+		httpx.Fail(w, r, err)
 		return
 	}
 
 	httpx.JSON(w, http.StatusCreated, e)
+}
+
+// insertTimeEntry writes the row, then re-reads it so the generated
+// duration_seconds column and the embedded task title come back populated —
+// PostgREST's returned representation does not include embedded resources.
+func (s *Server) insertTimeEntry(ctx context.Context, body map[string]any) (models.TimeEntry, error) {
+	var created struct {
+		ID uuid.UUID `json:"id"`
+	}
+	if err := s.data.From("time_entries").
+		Select("id").
+		Single().
+		Insert(ctx, body, &created); err != nil {
+		return models.TimeEntry{}, err
+	}
+
+	var row timeEntryRow
+	if err := s.data.From("time_entries").
+		Select(timeEntryCols).
+		Eq("id", created.ID).
+		Single().
+		Get(ctx, &row); err != nil {
+		return models.TimeEntry{}, err
+	}
+	return row.entry(), nil
 }
 
 type startTimerRequest struct {
@@ -186,18 +220,15 @@ func (s *Server) handleStartTimer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	e, err := scanTimeEntry(s.db.QueryRow(r.Context(), `
-		with inserted as (
-		  insert into time_entries (workspace_id, task_id, user_id, description, started_at)
-		  values ($1, nullif($2,'')::uuid, $3, nullif($4,''), now())
-		  returning *
-		)
-		select e.id, e.task_id, t.title, e.user_id, e.description,
-		       e.started_at, e.ended_at, e.duration_seconds, e.is_billable
-		  from inserted e left join tasks t on t.id = e.task_id`,
-		wsID, derefString(req.TaskID), userID, derefString(req.Description)))
+	e, err := s.insertTimeEntry(r.Context(), map[string]any{
+		"workspace_id": wsID,
+		"user_id":      userID,
+		"task_id":      nilIfEmpty(derefString(req.TaskID)),
+		"description":  nilIfEmpty(derefString(req.Description)),
+		"started_at":   time.Now().UTC(),
+	})
 	if err != nil {
-		httpx.Fail(w, r, db.MapError(err))
+		httpx.Fail(w, r, err)
 		return
 	}
 
@@ -213,25 +244,37 @@ func (s *Server) handleStopTimer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	e, err := scanTimeEntry(s.db.QueryRow(r.Context(), `
-		with stopped as (
-		  update time_entries set ended_at = now()
-		   where user_id = $1 and workspace_id = $2 and ended_at is null
-		  returning *
-		)
-		select e.id, e.task_id, t.title, e.user_id, e.description,
-		       e.started_at, e.ended_at, e.duration_seconds, e.is_billable
-		  from stopped e left join tasks t on t.id = e.task_id`, userID, wsID))
+	// Not Single(): zero matched rows means "no timer running", which is a 409
+	// with its own code, not the 404 that Single() would produce.
+	var updated []struct {
+		ID uuid.UUID `json:"id"`
+	}
+	err = s.data.From("time_entries").
+		Select("id").
+		Eq("user_id", userID).
+		Eq("workspace_id", wsID).
+		IsNull("ended_at", true).
+		Update(r.Context(), map[string]any{"ended_at": time.Now().UTC()}, &updated)
 	if err != nil {
-		mapped := db.MapError(err)
-		if mapped == httpx.ErrNotFound {
-			httpx.Fail(w, r, httpx.Errorf(http.StatusConflict, "no_running_timer",
-				"You do not have a timer running"))
-			return
-		}
-		httpx.Fail(w, r, mapped)
+		httpx.Fail(w, r, err)
 		return
 	}
+	if len(updated) == 0 {
+		httpx.Fail(w, r, httpx.Errorf(http.StatusConflict, "no_running_timer",
+			"You do not have a timer running"))
+		return
+	}
+
+	var row timeEntryRow
+	if err := s.data.From("time_entries").
+		Select(timeEntryCols).
+		Eq("id", updated[0].ID).
+		Single().
+		Get(r.Context(), &row); err != nil {
+		httpx.Fail(w, r, err)
+		return
+	}
+	e := row.entry()
 
 	s.hub.PublishTo(wsID, userID, realtime.Event{
 		Type: "timer.stopped", ActorID: userID, Payload: realtime.Marshal(e)})
@@ -246,18 +289,25 @@ func (s *Server) handleActiveTimer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	e, err := scanTimeEntry(s.db.QueryRow(r.Context(), timeEntrySelect+`
-		 where e.user_id = $1 and e.workspace_id = $2 and e.ended_at is null`, userID, wsID))
+	var rows []timeEntryRow
+	err = s.data.From("time_entries").
+		Select(timeEntryCols).
+		Eq("user_id", userID).
+		Eq("workspace_id", wsID).
+		IsNull("ended_at", true).
+		Limit(1).
+		Get(r.Context(), &rows)
 	if err != nil {
-		if db.MapError(err) == httpx.ErrNotFound {
-			httpx.JSON(w, http.StatusOK, map[string]any{"entry": nil})
-			return
-		}
-		httpx.Fail(w, r, db.MapError(err))
+		httpx.Fail(w, r, err)
 		return
 	}
 
-	httpx.JSON(w, http.StatusOK, map[string]any{"entry": e})
+	// No running timer is a normal state, not a 404.
+	if len(rows) == 0 {
+		httpx.JSON(w, http.StatusOK, map[string]any{"entry": nil})
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"entry": rows[0].entry()})
 }
 
 // ---------------------------------------------------------------- workload
@@ -270,47 +320,21 @@ func (s *Server) handleWorkload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rows, err := s.db.Query(r.Context(), `
-		select user_id, full_name, avatar_url, weekly_capacity_hours,
-		       open_hours, open_tasks, overdue_tasks, utilization_pct
-		  from workload_summary
-		 where workspace_id = $1
-		 order by utilization_pct desc nulls last`, wsID)
-	if err != nil {
-		httpx.Fail(w, r, db.MapError(err))
-		return
-	}
-	defer rows.Close()
-
 	out := []models.Workload{}
-	for rows.Next() {
-		var wl models.Workload
-		if err := rows.Scan(&wl.UserID, &wl.FullName, &wl.AvatarURL, &wl.WeeklyCapacityHours,
-			&wl.OpenHours, &wl.OpenTasks, &wl.OverdueTasks, &wl.UtilizationPct); err != nil {
-			httpx.Fail(w, r, db.MapError(err))
-			return
-		}
-		out = append(out, wl)
-	}
-	if err := rows.Err(); err != nil {
-		httpx.Fail(w, r, db.MapError(err))
+	err = s.data.From("workload_summary").
+		Select("user_id,full_name,avatar_url,weekly_capacity_hours,"+
+			"open_hours,open_tasks,overdue_tasks,utilization_pct").
+		Eq("workspace_id", wsID).
+		Order("utilization_pct", true).
+		Get(r.Context(), &out)
+	if err != nil {
+		httpx.Fail(w, r, err)
 		return
 	}
 
 	// Availability blocks overlapping the next 14 days, so the capacity bars can
-	// grey out people who are away.
-	availRows, err := s.db.Query(r.Context(), `
-		select id, user_id, kind, note, starts_at, ends_at, available_hours
-		  from availability_blocks
-		 where workspace_id = $1
-		   and tstzrange(starts_at, ends_at) && tstzrange(now(), now() + interval '14 days')
-		 order by starts_at`, wsID)
-	if err != nil {
-		httpx.Fail(w, r, db.MapError(err))
-		return
-	}
-	defer availRows.Close()
-
+	// grey out people who are away. Two half-open comparisons are the same test
+	// as the tstzrange && overlap operator, and PostgREST can express them.
 	type block struct {
 		ID             uuid.UUID `json:"id"`
 		UserID         uuid.UUID `json:"user_id"`
@@ -320,18 +344,18 @@ func (s *Server) handleWorkload(w http.ResponseWriter, r *http.Request) {
 		EndsAt         time.Time `json:"ends_at"`
 		AvailableHours *float64  `json:"available_hours"`
 	}
+
+	now := time.Now().UTC()
 	blocks := []block{}
-	for availRows.Next() {
-		var b block
-		if err := availRows.Scan(&b.ID, &b.UserID, &b.Kind, &b.Note,
-			&b.StartsAt, &b.EndsAt, &b.AvailableHours); err != nil {
-			httpx.Fail(w, r, db.MapError(err))
-			return
-		}
-		blocks = append(blocks, b)
-	}
-	if err := availRows.Err(); err != nil {
-		httpx.Fail(w, r, db.MapError(err))
+	err = s.data.From("availability_blocks").
+		Select("id,user_id,kind,note,starts_at,ends_at,available_hours").
+		Eq("workspace_id", wsID).
+		Lt("starts_at", now.AddDate(0, 0, 14).Format(time.RFC3339)).
+		Gt("ends_at", now.Format(time.RFC3339)).
+		Order("starts_at", false).
+		Get(r.Context(), &blocks)
+	if err != nil {
+		httpx.Fail(w, r, err)
 		return
 	}
 

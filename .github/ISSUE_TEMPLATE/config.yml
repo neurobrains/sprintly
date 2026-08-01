@@ -5,4 +5,4 @@ contact_links:
     about: Setup help, design discussion, or anything not yet a concrete bug.
   - name: Report a security vulnerability
     url: https://github.com/neurobrains/sprintly/security/advisories/new
-    about: Please report privately, never as a public issue. See SECURITY.md.
+    about: Please report privately, never as a public issue.

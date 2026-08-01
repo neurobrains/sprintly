@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"net/http"
 	"regexp"
 	"strings"
@@ -8,11 +9,32 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
-	"github.com/sprintly/sprintly/backend/internal/db"
 	"github.com/sprintly/sprintly/backend/internal/httpx"
 	"github.com/sprintly/sprintly/backend/internal/models"
 	"github.com/sprintly/sprintly/backend/internal/realtime"
 )
+
+// commentCols embeds the author through the author_id foreign key. The
+// constraint name is spelled out because comments has more than one FK to
+// profiles-adjacent tables, and PostgREST needs the disambiguation.
+const commentCols = "id,task_id,doc_id,parent_id,body,mentions,edited_at,created_at," +
+	"profiles!comments_author_id_fkey(" + profileCols + ")"
+
+type commentRow struct {
+	models.Comment
+	AuthorProfile *models.Profile `json:"profiles"`
+}
+
+func (r commentRow) comment() models.Comment {
+	c := r.Comment
+	if r.AuthorProfile != nil {
+		c.Author = *r.AuthorProfile
+	}
+	if c.Mentions == nil {
+		c.Mentions = []uuid.UUID{}
+	}
+	return c
+}
 
 func (s *Server) handleListComments(w http.ResponseWriter, r *http.Request) {
 	_, wsID, _, err := s.ctxIDs(r)
@@ -26,35 +48,21 @@ func (s *Server) handleListComments(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rows, err := s.db.Query(r.Context(), `
-		select c.id, c.task_id, c.doc_id, c.parent_id, c.body, c.mentions,
-		       c.edited_at, c.created_at,
-		       p.id, p.email, p.full_name, p.avatar_url, p.presence
-		  from comments c
-		  join profiles p on p.id = c.author_id
-		 where c.task_id = $1 and c.workspace_id = $2
-		 order by c.created_at`, taskID, wsID)
+	var rows []commentRow
+	err = s.data.From("comments").
+		Select(commentCols).
+		Eq("task_id", taskID).
+		Eq("workspace_id", wsID).
+		Order("created_at", false).
+		Get(r.Context(), &rows)
 	if err != nil {
-		httpx.Fail(w, r, db.MapError(err))
+		httpx.Fail(w, r, err)
 		return
 	}
-	defer rows.Close()
 
-	out := []models.Comment{}
-	for rows.Next() {
-		var c models.Comment
-		if err := rows.Scan(&c.ID, &c.TaskID, &c.DocID, &c.ParentID, &c.Body, &c.Mentions,
-			&c.EditedAt, &c.CreatedAt,
-			&c.Author.ID, &c.Author.Email, &c.Author.FullName, &c.Author.AvatarURL,
-			&c.Author.Presence); err != nil {
-			httpx.Fail(w, r, db.MapError(err))
-			return
-		}
-		out = append(out, c)
-	}
-	if err := rows.Err(); err != nil {
-		httpx.Fail(w, r, db.MapError(err))
-		return
+	out := make([]models.Comment, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, row.comment())
 	}
 
 	httpx.JSON(w, http.StatusOK, map[string]any{"comments": out})
@@ -70,6 +78,22 @@ type createCommentRequest struct {
 
 // mentionRe matches the `@[Display Name](uuid)` form the editor emits.
 var mentionRe = regexp.MustCompile(`@\[[^\]]*\]\(([0-9a-fA-F-]{36})\)`)
+
+// assertTaskInWorkspace is the guard the old `where exists (...)` sub-select
+// provided. It has to be its own round trip now, so every caller that writes a
+// row keyed by task_id must run it first — otherwise a task UUID from another
+// tenant would be accepted.
+func (s *Server) assertTaskInWorkspace(ctx context.Context, taskID, wsID uuid.UUID) error {
+	var t struct {
+		ID uuid.UUID `json:"id"`
+	}
+	return s.data.From("tasks").
+		Select("id").
+		Eq("id", taskID).
+		Eq("workspace_id", wsID).
+		Single().
+		Get(ctx, &t)
+}
 
 func (s *Server) handleCreateComment(w http.ResponseWriter, r *http.Request) {
 	userID, wsID, _, err := s.ctxIDs(r)
@@ -98,31 +122,47 @@ func (s *Server) handleCreateComment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if err := s.assertTaskInWorkspace(r.Context(), taskID, wsID); err != nil {
+		httpx.Fail(w, r, err)
+		return
+	}
+
 	mentions := req.Mentions
 	if len(mentions) == 0 {
 		mentions = parseMentions(req.Body)
 	}
 
-	var c models.Comment
-	err = s.db.QueryRow(r.Context(), `
-		with inserted as (
-		  insert into comments (workspace_id, task_id, parent_id, author_id, body, mentions)
-		  select $1, $2, nullif($3,'')::uuid, $4, $5, $6::uuid[]
-		   where exists (select 1 from tasks t where t.id = $2 and t.workspace_id = $1)
-		  returning *
-		)
-		select c.id, c.task_id, c.doc_id, c.parent_id, c.body, c.mentions,
-		       c.edited_at, c.created_at,
-		       p.id, p.email, p.full_name, p.avatar_url, p.presence
-		  from inserted c join profiles p on p.id = c.author_id`,
-		wsID, taskID, derefString(req.ParentID), userID, req.Body, mentions,
-	).Scan(&c.ID, &c.TaskID, &c.DocID, &c.ParentID, &c.Body, &c.Mentions,
-		&c.EditedAt, &c.CreatedAt,
-		&c.Author.ID, &c.Author.Email, &c.Author.FullName, &c.Author.AvatarURL, &c.Author.Presence)
+	var created struct {
+		ID uuid.UUID `json:"id"`
+	}
+	err = s.data.From("comments").
+		Select("id").
+		Single().
+		Insert(r.Context(), map[string]any{
+			"workspace_id": wsID,
+			"task_id":      taskID,
+			"parent_id":    nilIfEmpty(derefString(req.ParentID)),
+			"author_id":    userID,
+			"body":         req.Body,
+			"mentions":     mentions,
+		}, &created)
 	if err != nil {
-		httpx.Fail(w, r, db.MapError(err))
+		httpx.Fail(w, r, err)
 		return
 	}
+
+	// Re-read for the embedded author — PostgREST does not return embedded
+	// resources in an insert's representation.
+	var row commentRow
+	if err := s.data.From("comments").
+		Select(commentCols).
+		Eq("id", created.ID).
+		Single().
+		Get(r.Context(), &row); err != nil {
+		httpx.Fail(w, r, err)
+		return
+	}
+	c := row.comment()
 
 	// The DB trigger writes mention notifications; push them live from here.
 	for _, m := range c.Mentions {
@@ -163,6 +203,14 @@ func parseMentions(body string) []uuid.UUID {
 
 // ---------------------------------------------------------------- activity
 
+type activityRow struct {
+	models.Activity
+	ActorProfile *models.Profile `json:"profiles"`
+}
+
+const activityCols = "id,task_id,verb,field,old_value,new_value,created_at," +
+	"profiles!activities_actor_id_fkey(" + profileCols + ")"
+
 func (s *Server) handleTaskActivity(w http.ResponseWriter, r *http.Request) {
 	_, wsID, _, err := s.ctxIDs(r)
 	if err != nil {
@@ -174,7 +222,10 @@ func (s *Server) handleTaskActivity(w http.ResponseWriter, r *http.Request) {
 		httpx.Fail(w, r, err)
 		return
 	}
-	s.writeActivity(w, r, `a.workspace_id = $1 and a.task_id = $2`, wsID, taskID)
+
+	s.writeActivity(w, r, s.data.From("activities").
+		Eq("workspace_id", wsID).
+		Eq("task_id", taskID))
 }
 
 func (s *Server) handleWorkspaceActivity(w http.ResponseWriter, r *http.Request) {
@@ -183,50 +234,30 @@ func (s *Server) handleWorkspaceActivity(w http.ResponseWriter, r *http.Request)
 		httpx.Fail(w, r, err)
 		return
 	}
-	s.writeActivity(w, r, `a.workspace_id = $1 and ($2::uuid is null or a.project_id = $2)`,
-		wsID, optionalUUID(r.URL.Query().Get("project_id")))
+
+	q := s.data.From("activities").Eq("workspace_id", wsID)
+	if projectID := optionalUUID(r.URL.Query().Get("project_id")); projectID != nil {
+		q = q.Eq("project_id", *projectID)
+	}
+	s.writeActivity(w, r, q)
 }
 
-func (s *Server) writeActivity(w http.ResponseWriter, r *http.Request, where string, args ...any) {
-	args = append(args, httpx.QueryInt(r, "limit", 50, 200))
-	rows, err := s.db.Query(r.Context(), `
-		select a.id, a.task_id, a.verb, a.field, a.old_value, a.new_value, a.created_at,
-		       p.id, p.email, p.full_name, p.avatar_url, p.presence
-		  from activities a
-		  left join profiles p on p.id = a.actor_id
-		 where `+where+`
-		 order by a.created_at desc
-		 limit $`+itoa(len(args)), args...)
+func (s *Server) writeActivity(w http.ResponseWriter, r *http.Request, q *supaQuery) {
+	var rows []activityRow
+	err := q.Select(activityCols).
+		Order("created_at", true).
+		Limit(httpx.QueryInt(r, "limit", 50, 200)).
+		Get(r.Context(), &rows)
 	if err != nil {
-		httpx.Fail(w, r, db.MapError(err))
+		httpx.Fail(w, r, err)
 		return
 	}
-	defer rows.Close()
 
-	out := []models.Activity{}
-	for rows.Next() {
-		var (
-			a       models.Activity
-			id      *uuid.UUID
-			email   *string
-			name    *string
-			avatar  *string
-			present *string
-		)
-		if err := rows.Scan(&a.ID, &a.TaskID, &a.Verb, &a.Field, &a.OldValue, &a.NewValue,
-			&a.CreatedAt, &id, &email, &name, &avatar, &present); err != nil {
-			httpx.Fail(w, r, db.MapError(err))
-			return
-		}
-		if id != nil {
-			a.Actor = &models.Profile{ID: *id, Email: deref(email), FullName: name,
-				AvatarURL: avatar, Presence: deref(present)}
-		}
+	out := make([]models.Activity, 0, len(rows))
+	for _, row := range rows {
+		a := row.Activity
+		a.Actor = row.ActorProfile
 		out = append(out, a)
-	}
-	if err := rows.Err(); err != nil {
-		httpx.Fail(w, r, db.MapError(err))
-		return
 	}
 
 	httpx.JSON(w, http.StatusOK, map[string]any{"activity": out})
@@ -246,46 +277,27 @@ func (s *Server) handleListDependencies(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// One query for both directions; `direction` tells the UI which list to
-	// render it under ("Blocked by" vs "Blocks").
-	rows, err := s.db.Query(r.Context(), `
-		select d.id, d.source_id, d.target_id, d.kind,
-		       other.title, op.key, other.number, other.state,
-		       case when d.target_id = $1 then 'incoming' else 'outgoing' end
-		  from task_dependencies d
-		  join tasks other on other.id = case when d.target_id = $1 then d.source_id else d.target_id end
-		  join projects op on op.id = other.project_id
-		 where d.workspace_id = $2 and (d.source_id = $1 or d.target_id = $1)
-		 order by d.created_at`, taskID, wsID)
-	if err != nil {
-		httpx.Fail(w, r, db.MapError(err))
-		return
-	}
-	defer rows.Close()
-
+	// Both directions in one result, with `direction` telling the UI which list
+	// to render it under ("Blocked by" vs "Blocks"). The join target depends on
+	// which end of the edge the task is on, which is a CASE — so it stays SQL.
 	type dep struct {
 		models.Dependency
-		Direction string `json:"direction"`
+		ProjectKey string `json:"project_key"`
+		Number     int    `json:"number"`
+		Direction  string `json:"direction"`
 	}
 
 	out := []dep{}
-	for rows.Next() {
-		var (
-			d      dep
-			key    string
-			number int
-		)
-		if err := rows.Scan(&d.ID, &d.SourceID, &d.TargetID, &d.Kind,
-			&d.Title, &key, &number, &d.State, &d.Direction); err != nil {
-			httpx.Fail(w, r, db.MapError(err))
-			return
-		}
-		d.Ref = taskRef(key, number)
-		out = append(out, d)
-	}
-	if err := rows.Err(); err != nil {
-		httpx.Fail(w, r, db.MapError(err))
+	err = s.data.RPC(r.Context(), "task_dependency_list", map[string]any{
+		"p_task":      taskID,
+		"p_workspace": wsID,
+	}, &out)
+	if err != nil {
+		httpx.Fail(w, r, err)
 		return
+	}
+	for i := range out {
+		out[i].Ref = taskRef(out[i].ProjectKey, out[i].Number)
 	}
 
 	httpx.JSON(w, http.StatusOK, map[string]any{"dependencies": out})
@@ -340,23 +352,47 @@ func (s *Server) handleCreateDependency(w http.ResponseWriter, r *http.Request) 
 		source, target = otherID, taskID
 	}
 
-	var id uuid.UUID
-	err = s.db.QueryRow(r.Context(), `
-		insert into task_dependencies (workspace_id, source_id, target_id, kind)
-		select $1, $2, $3, $4::dependency_kind
-		 where (select count(*) from tasks t
-		         where t.id in ($2, $3) and t.workspace_id = $1) = 2
-		returning id`, wsID, source, target, req.Kind).Scan(&id)
+	// Both ends must live in this workspace. The old query enforced it with a
+	// count sub-select; here it is an explicit read before the write.
+	var found []struct {
+		ID uuid.UUID `json:"id"`
+	}
+	err = s.data.From("tasks").
+		Select("id").
+		In("id", []string{source.String(), target.String()}).
+		Eq("workspace_id", wsID).
+		Get(r.Context(), &found)
 	if err != nil {
-		httpx.Fail(w, r, db.MapError(err))
+		httpx.Fail(w, r, err)
+		return
+	}
+	if len(found) != 2 {
+		httpx.Fail(w, r, httpx.ErrNotFound)
 		return
 	}
 
+	var created struct {
+		ID uuid.UUID `json:"id"`
+	}
+	// A cycle trips the deps_guard_cycle trigger, which raises check_violation
+	// and surfaces as a 400 through the error mapping.
+	err = s.data.From("task_dependencies").
+		Select("id").
+		Single().
+		Insert(r.Context(), map[string]any{
+			"workspace_id": wsID, "source_id": source, "target_id": target, "kind": req.Kind,
+		}, &created)
+	if err != nil {
+		httpx.Fail(w, r, err)
+		return
+	}
+
+	payload := map[string]any{
+		"id": created.ID, "source_id": source, "target_id": target, "kind": req.Kind,
+	}
 	s.hub.Publish(realtime.Event{Type: "dependency.created", WorkspaceID: wsID,
-		ActorID: userID, Payload: realtime.Marshal(map[string]any{
-			"id": id, "source_id": source, "target_id": target, "kind": req.Kind})})
-	httpx.JSON(w, http.StatusCreated, map[string]any{
-		"id": id, "source_id": source, "target_id": target, "kind": req.Kind})
+		ActorID: userID, Payload: realtime.Marshal(payload)})
+	httpx.JSON(w, http.StatusCreated, payload)
 }
 
 func (s *Server) handleDeleteDependency(w http.ResponseWriter, r *http.Request) {
@@ -371,13 +407,19 @@ func (s *Server) handleDeleteDependency(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	tag, err := s.db.Exec(r.Context(),
-		`delete from task_dependencies where id = $1 and workspace_id = $2`, depID, wsID)
+	var deleted []struct {
+		ID uuid.UUID `json:"id"`
+	}
+	err = s.data.From("task_dependencies").
+		Select("id").
+		Eq("id", depID).
+		Eq("workspace_id", wsID).
+		Delete(r.Context(), &deleted)
 	if err != nil {
-		httpx.Fail(w, r, db.MapError(err))
+		httpx.Fail(w, r, err)
 		return
 	}
-	if tag.RowsAffected() == 0 {
+	if len(deleted) == 0 {
 		httpx.Fail(w, r, httpx.ErrNotFound)
 		return
 	}

@@ -211,11 +211,17 @@ Use the [issue templates](https://github.com/neurobrains/sprintly/issues/new/cho
 For bugs, the single most useful thing you can include is the exact
 `{ "code": ... }` the API returned.
 
-**Security issues do not belong in public issues** — see [SECURITY.md](SECURITY.md).
+**Security issues do not belong in public issues.** Sprintly is self-hosted, so a
+public report is a working exploit against every deployment that hasn't updated
+yet. Report privately via
+[Security → Report a vulnerability](https://github.com/neurobrains/sprintly/security/advisories/new).
 
-## Code of conduct
-
-Participation is governed by the [Code of Conduct](CODE_OF_CONDUCT.md).
+Worth knowing before you report: the Go API connects as the table owner and is
+deliberately *not* constrained by RLS — authorization is enforced by
+`requireWorkspace` and `requireRole`. "The service role bypasses RLS" is by
+design; a handler that forgets to scope a query by `workspace_id` is a real
+vulnerability. The Supabase `anon` key is public by design and ships in the
+client bundle.
 
 ## Licence
 

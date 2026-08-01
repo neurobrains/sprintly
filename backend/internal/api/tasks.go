@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -10,82 +9,35 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
-	"github.com/sprintly/sprintly/backend/internal/db"
 	"github.com/sprintly/sprintly/backend/internal/httpx"
 	"github.com/sprintly/sprintly/backend/internal/models"
 	"github.com/sprintly/sprintly/backend/internal/realtime"
 )
 
-// taskSelect returns everything a board card needs in one round trip. The
-// correlated counts are cheap because each is a covered index lookup, and it
-// avoids the N+1 that would otherwise fire once per card.
-const taskSelect = `
-	select t.id, t.workspace_id, t.project_id, pr.key, t.parent_id, t.number, t.title,
-	       t.description, t.state, t.priority, t.board_rank,
-	       t.assignee_id, t.reporter_id, t.start_date, t.due_date, t.estimate_hours,
-	       t.completed_at, t.created_at, t.updated_at,
-	       a.id, a.email, a.full_name, a.avatar_url, a.presence,
-	       (select count(*) from tasks c where c.parent_id = t.id),
-	       (select count(*) from tasks c where c.parent_id = t.id and c.state = 'done'),
-	       (select count(*) from comments c where c.task_id = t.id),
-	       (select count(*) from task_dependencies d
-	          join tasks bt on bt.id = d.source_id
-	         where d.target_id = t.id and d.kind = 'blocks' and bt.state <> 'done'),
-	       (select coalesce(sum(te.duration_seconds), 0)::int
-	          from time_entries te where te.task_id = t.id),
-	       coalesce(
-	         (select json_agg(json_build_object('id', l.id, 'name', l.name, 'color', l.color)
-	                          order by l.name)
-	            from task_labels tl join labels l on l.id = tl.label_id
-	           where tl.task_id = t.id), '[]'::json)::text
-	  from tasks t
-	  join projects pr on pr.id = t.project_id
-	  left join profiles a on a.id = t.assignee_id`
-
-func scanTask(row interface{ Scan(...any) error }) (models.Task, error) {
-	var (
-		t          models.Task
-		labelsJSON string
-
-		assigneeID     *uuid.UUID
-		assigneeEmail  *string
-		assigneeName   *string
-		assigneeAvatar *string
-		assigneePres   *string
-	)
-
-	err := row.Scan(&t.ID, &t.WorkspaceID, &t.ProjectID, &t.ProjectKey, &t.ParentID, &t.Number,
-		&t.Title, &t.Description, &t.State, &t.Priority, &t.BoardRank,
-		&t.AssigneeID, &t.ReporterID, &t.StartDate, &t.DueDate, &t.EstimateHours,
-		&t.CompletedAt, &t.CreatedAt, &t.UpdatedAt,
-		&assigneeID, &assigneeEmail, &assigneeName, &assigneeAvatar, &assigneePres,
-		&t.SubtaskCount, &t.SubtaskDone, &t.CommentCount, &t.BlockedBy, &t.LoggedSecs,
-		&labelsJSON)
-	if err != nil {
-		return t, err
-	}
-
-	t.Ref = taskRef(t.ProjectKey, t.Number)
-	t.Labels = parseLabels(labelsJSON)
-
-	if assigneeID != nil {
-		t.Assignee = &models.Profile{
-			ID:        *assigneeID,
-			Email:     deref(assigneeEmail),
-			FullName:  assigneeName,
-			AvatarURL: assigneeAvatar,
-			Presence:  deref(assigneePres),
-		}
-	}
-	return t, nil
-}
+// Task reads go through the task_list / task_detail RPCs rather than PostgREST
+// selects.
+//
+// A board card carries five aggregates (sub-task counts, comment count, blocking
+// count, logged seconds) and its label set. In SQL those are correlated
+// sub-queries over covered indexes — one round trip for the whole board. Over
+// PostgREST they would be one request per card per aggregate, so a 200-card
+// board becomes a thousand HTTP calls. The RPCs return rows whose column names
+// match models.Task's JSON tags, so they decode straight through.
 
 func taskRef(key string, number int) string { return key + "-" + strconv.Itoa(number) }
 
+// finishTask fills the derived fields the RPC does not compute.
+func finishTask(t *models.Task) {
+	t.Ref = taskRef(t.ProjectKey, t.Number)
+	if t.Labels == nil {
+		t.Labels = []models.Label{}
+	}
+}
+
 // ---------------------------------------------------------------- list
 
-// handleListTasks powers every view (board, list, calendar, Gantt). Filters are
-// composed into one WHERE clause; unset filters cost nothing.
+// handleListTasks powers every view (board, list, calendar, Gantt). Unset
+// filters are passed as null and cost nothing in the RPC's WHERE clause.
 func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 	_, wsID, _, err := s.ctxIDs(r)
 	if err != nil {
@@ -94,12 +46,20 @@ func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 	}
 
 	q := r.URL.Query()
-	where := []string{"t.workspace_id = $1"}
-	args := []any{wsID}
-
-	add := func(clause string, value any) {
-		args = append(args, value)
-		where = append(where, fmt.Sprintf(clause, len(args)))
+	args := map[string]any{
+		"p_workspace":    wsID,
+		"p_project":      nil,
+		"p_assignee":     nil,
+		"p_unassigned":   false,
+		"p_states":       nil,
+		"p_priorities":   nil,
+		"p_search":       nil,
+		"p_parent":       nil,
+		"p_top_level":    false,
+		"p_due_before":   nil,
+		"p_due_after":    nil,
+		"p_include_done": q.Get("include_done") == "true",
+		"p_limit":        httpx.QueryInt(r, "limit", 500, 1000),
 	}
 
 	if v := q.Get("project_id"); v != "" {
@@ -108,18 +68,18 @@ func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 			httpx.Fail(w, r, err)
 			return
 		}
-		add("t.project_id = $%d", id)
+		args["p_project"] = id
 	}
 	if v := q.Get("assignee_id"); v != "" {
 		if v == "unassigned" {
-			where = append(where, "t.assignee_id is null")
+			args["p_unassigned"] = true
 		} else {
 			id, err := httpx.UUIDParam(v, "assignee_id")
 			if err != nil {
 				httpx.Fail(w, r, err)
 				return
 			}
-			add("t.assignee_id = $%d", id)
+			args["p_assignee"] = id
 		}
 	}
 	if v := q.Get("state"); v != "" {
@@ -130,62 +90,47 @@ func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		add("t.state = any($%d::task_state[])", states)
+		args["p_states"] = states
 	}
 	if v := q.Get("priority"); v != "" {
-		add("t.priority = any($%d::task_priority[])", strings.Split(v, ","))
+		priorities := strings.Split(v, ",")
+		for _, p := range priorities {
+			if !validPriority(p) {
+				httpx.Fail(w, r, httpx.BadRequest("unknown priority %q", p))
+				return
+			}
+		}
+		args["p_priorities"] = priorities
 	}
 	if v := strings.TrimSpace(q.Get("search")); v != "" {
-		add("t.title ilike '%%' || $%d || '%%'", v)
+		args["p_search"] = v
 	}
 	if v := q.Get("parent_id"); v != "" {
 		if v == "none" {
-			where = append(where, "t.parent_id is null")
+			args["p_top_level"] = true
 		} else {
 			id, err := httpx.UUIDParam(v, "parent_id")
 			if err != nil {
 				httpx.Fail(w, r, err)
 				return
 			}
-			add("t.parent_id = $%d", id)
+			args["p_parent"] = id
 		}
 	}
 	if v := q.Get("due_before"); v != "" {
-		add("t.due_date < $%d::timestamptz", v)
+		args["p_due_before"] = v
 	}
 	if v := q.Get("due_after"); v != "" {
-		add("t.due_date >= $%d::timestamptz", v)
+		args["p_due_after"] = v
 	}
-	if q.Get("include_done") != "true" && q.Get("state") == "" {
-		where = append(where, "t.state <> 'cancelled'")
-	}
-
-	limit := httpx.QueryInt(r, "limit", 500, 1000)
-	args = append(args, limit)
-
-	query := taskSelect + " where " + strings.Join(where, " and ") +
-		" order by t.state, t.board_rank, t.created_at" +
-		fmt.Sprintf(" limit $%d", len(args))
-
-	rows, err := s.db.Query(r.Context(), query, args...)
-	if err != nil {
-		httpx.Fail(w, r, db.MapError(err))
-		return
-	}
-	defer rows.Close()
 
 	out := []models.Task{}
-	for rows.Next() {
-		t, err := scanTask(rows)
-		if err != nil {
-			httpx.Fail(w, r, db.MapError(err))
-			return
-		}
-		out = append(out, t)
-	}
-	if err := rows.Err(); err != nil {
-		httpx.Fail(w, r, db.MapError(err))
+	if err := s.data.RPC(r.Context(), "task_list", args, &out); err != nil {
+		httpx.Fail(w, r, err)
 		return
+	}
+	for i := range out {
+		finishTask(&out[i])
 	}
 
 	httpx.JSON(w, http.StatusOK, map[string]any{"tasks": out})
@@ -212,11 +157,15 @@ func (s *Server) handleGetTask(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) loadTask(ctx context.Context, wsID, taskID uuid.UUID) (models.Task, error) {
-	t, err := scanTask(s.db.QueryRow(ctx,
-		taskSelect+` where t.id = $1 and t.workspace_id = $2`, taskID, wsID))
+	var t models.Task
+	err := s.data.RPCSingle(ctx, "task_detail", map[string]any{
+		"p_workspace": wsID,
+		"p_task":      taskID,
+	}, &t)
 	if err != nil {
-		return t, db.MapError(err)
+		return t, err
 	}
+	finishTask(&t)
 	return t, nil
 }
 
@@ -236,6 +185,10 @@ type createTaskRequest struct {
 	LabelIDs      []uuid.UUID `json:"label_ids,omitempty"`
 }
 
+// handleCreateTask delegates the write to an RPC: the row, its labels and the
+// "created" activity are one transaction, and the new card's board_rank is
+// derived from the current minimum in its column, which has to be read and
+// written atomically or two simultaneous creates collide.
 func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 	userID, wsID, _, err := s.ctxIDs(r)
 	if err != nil {
@@ -274,45 +227,29 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	labels := make([]string, 0, len(req.LabelIDs))
+	for _, id := range req.LabelIDs {
+		labels = append(labels, id.String())
+	}
+
 	var taskID uuid.UUID
-	err = s.db.InTx(r.Context(), func(tx pgxTx) error {
-		// New cards land at the top of their column.
-		err := tx.QueryRow(r.Context(), `
-			insert into tasks (workspace_id, project_id, parent_id, title, description, state,
-			                   priority, assignee_id, reporter_id, start_date, due_date,
-			                   estimate_hours, board_rank)
-			select $1, $2, nullif($3,'')::uuid, $4, $5, $6::task_state, $7::task_priority,
-			       nullif($8,'')::uuid, $9, nullif($10,'')::timestamptz, nullif($11,'')::timestamptz,
-			       $12,
-			       coalesce((select min(board_rank) from tasks
-			                  where project_id = $2 and state = $6::task_state), 131072) / 2
-			 where exists (select 1 from projects p where p.id = $2 and p.workspace_id = $1)
-			returning id`,
-			wsID, projectID, derefString(req.ParentID), req.Title, req.Description, req.State,
-			req.Priority, derefString(req.AssigneeID), userID,
-			derefString(req.StartDate), derefString(req.DueDate), req.EstimateHours,
-		).Scan(&taskID)
-		if err != nil {
-			return err
-		}
-
-		if len(req.LabelIDs) > 0 {
-			if _, err := tx.Exec(r.Context(), `
-				insert into task_labels (task_id, label_id)
-				select $1, l.id from labels l
-				 where l.id = any($2::uuid[]) and l.workspace_id = $3
-				on conflict do nothing`, taskID, req.LabelIDs, wsID); err != nil {
-				return err
-			}
-		}
-
-		_, err = tx.Exec(r.Context(), `
-			insert into activities (workspace_id, task_id, project_id, actor_id, verb)
-			values ($1, $2, $3, $4, 'created')`, wsID, taskID, projectID, userID)
-		return err
-	})
+	err = s.data.RPC(r.Context(), "create_task", map[string]any{
+		"p_workspace": wsID,
+		"p_project":   projectID,
+		"p_parent":    nilIfEmpty(derefString(req.ParentID)),
+		"p_title":     req.Title,
+		"p_desc":      req.Description,
+		"p_state":     req.State,
+		"p_priority":  req.Priority,
+		"p_assignee":  nilIfEmpty(derefString(req.AssigneeID)),
+		"p_reporter":  userID,
+		"p_start":     nilIfEmpty(derefString(req.StartDate)),
+		"p_due":       nilIfEmpty(derefString(req.DueDate)),
+		"p_estimate":  req.EstimateHours,
+		"p_labels":    labels,
+	}, &taskID)
 	if err != nil {
-		httpx.Fail(w, r, db.MapError(err))
+		httpx.Fail(w, r, err)
 		return
 	}
 
@@ -375,46 +312,65 @@ func (s *Server) handleUpdateTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = s.db.InTx(r.Context(), func(tx pgxTx) error {
-		if _, err := tx.Exec(r.Context(), `
-			update tasks set
-			  title         = coalesce($3, title),
-			  description   = case when $4::text is null then description else nullif($4,'') end,
-			  state         = coalesce($5::task_state, state),
-			  priority      = coalesce($6::task_priority, priority),
-			  assignee_id   = case when $7::text is null then assignee_id else nullif($7,'')::uuid end,
-			  parent_id     = case when $8::text is null then parent_id else nullif($8,'')::uuid end,
-			  start_date    = case when $9::text is null then start_date else nullif($9,'')::timestamptz end,
-			  due_date      = case when $10::text is null then due_date else nullif($10,'')::timestamptz end,
-			  estimate_hours = coalesce($11, estimate_hours)
-			where id = $1 and workspace_id = $2`,
-			taskID, wsID, req.Title, req.Description, req.State, req.Priority,
-			req.AssigneeID, req.ParentID, req.StartDate, req.DueDate, req.EstimateHours,
-		); err != nil {
-			return err
-		}
+	patch := map[string]any{}
+	if req.Title != nil {
+		patch["title"] = *req.Title
+	}
+	if req.Description != nil {
+		patch["description"] = nilIfEmpty(*req.Description)
+	}
+	if req.State != nil {
+		patch["state"] = *req.State
+	}
+	if req.Priority != nil {
+		patch["priority"] = *req.Priority
+	}
+	if req.AssigneeID != nil {
+		patch["assignee_id"] = nilIfEmpty(strings.TrimSpace(*req.AssigneeID))
+	}
+	if req.ParentID != nil {
+		patch["parent_id"] = nilIfEmpty(strings.TrimSpace(*req.ParentID))
+	}
+	if req.StartDate != nil {
+		patch["start_date"] = nilIfEmpty(strings.TrimSpace(*req.StartDate))
+	}
+	if req.DueDate != nil {
+		patch["due_date"] = nilIfEmpty(strings.TrimSpace(*req.DueDate))
+	}
+	if req.EstimateHours != nil {
+		patch["estimate_hours"] = *req.EstimateHours
+	}
 
-		// A present label_ids array replaces the whole set; absent leaves it alone.
-		if req.LabelIDs != nil {
-			if _, err := tx.Exec(r.Context(),
-				`delete from task_labels where task_id = $1`, taskID); err != nil {
-				return err
-			}
-			if len(*req.LabelIDs) > 0 {
-				if _, err := tx.Exec(r.Context(), `
-					insert into task_labels (task_id, label_id)
-					select $1, l.id from labels l
-					 where l.id = any($2::uuid[]) and l.workspace_id = $3`,
-					taskID, *req.LabelIDs, wsID); err != nil {
-					return err
-				}
-			}
+	if len(patch) > 0 {
+		if err := s.data.From("tasks").
+			Eq("id", taskID).
+			Eq("workspace_id", wsID).
+			Update(r.Context(), patch, nil); err != nil {
+			httpx.Fail(w, r, err)
+			return
 		}
+	}
 
-		return s.recordChanges(r.Context(), tx, wsID, userID, before, req)
-	})
-	if err != nil {
-		httpx.Fail(w, r, db.MapError(err))
+	// A present label_ids array replaces the whole set; absent leaves it alone.
+	// The RPC does the delete and the insert together and filters the ids down to
+	// labels that belong to this workspace.
+	if req.LabelIDs != nil {
+		ids := make([]string, 0, len(*req.LabelIDs))
+		for _, id := range *req.LabelIDs {
+			ids = append(ids, id.String())
+		}
+		if err := s.data.RPC(r.Context(), "set_task_labels", map[string]any{
+			"p_task":      taskID,
+			"p_workspace": wsID,
+			"p_labels":    ids,
+		}, nil); err != nil {
+			httpx.Fail(w, r, err)
+			return
+		}
+	}
+
+	if err := s.recordChanges(r.Context(), wsID, userID, before, req); err != nil {
+		httpx.Fail(w, r, err)
 		return
 	}
 
@@ -431,8 +387,8 @@ func (s *Server) handleUpdateTask(w http.ResponseWriter, r *http.Request) {
 }
 
 // recordChanges writes one activity row per changed field, which is what the
-// task's activity stream renders.
-func (s *Server) recordChanges(ctx context.Context, tx pgxTx, wsID, actorID uuid.UUID,
+// task's activity stream renders. All the rows go in one insert.
+func (s *Server) recordChanges(ctx context.Context, wsID, actorID uuid.UUID,
 	before models.Task, req updateTaskRequest) error {
 
 	type change struct{ field, old, new string }
@@ -465,23 +421,31 @@ func (s *Server) recordChanges(ctx context.Context, tx pgxTx, wsID, actorID uuid
 			changes = append(changes, change{"due_date", old, *req.DueDate})
 		}
 	}
+	if len(changes) == 0 {
+		return nil
+	}
 
+	rows := make([]map[string]any, 0, len(changes))
 	for _, c := range changes {
 		verb := "updated"
-		if c.field == "state" {
+		switch c.field {
+		case "state":
 			verb = "state_changed"
-		} else if c.field == "assignee" {
+		case "assignee":
 			verb = "assigned"
 		}
-		if _, err := tx.Exec(ctx, `
-			insert into activities (workspace_id, task_id, project_id, actor_id,
-			                        verb, field, old_value, new_value)
-			values ($1, $2, $3, $4, $5, $6, nullif($7,''), nullif($8,''))`,
-			wsID, before.ID, before.ProjectID, actorID, verb, c.field, c.old, c.new); err != nil {
-			return err
-		}
+		rows = append(rows, map[string]any{
+			"workspace_id": wsID,
+			"task_id":      before.ID,
+			"project_id":   before.ProjectID,
+			"actor_id":     actorID,
+			"verb":         verb,
+			"field":        c.field,
+			"old_value":    nilIfEmpty(c.old),
+			"new_value":    nilIfEmpty(c.new),
+		})
 	}
-	return nil
+	return s.data.From("activities").Insert(ctx, rows, nil)
 }
 
 // ---------------------------------------------------------------- move (drag & drop)
@@ -516,25 +480,22 @@ func (s *Server) handleMoveTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Confirm the task is in this workspace before the RPC, which is not
-	// workspace-scoped on its own.
-	var exists bool
-	if err := s.db.QueryRow(r.Context(),
-		`select exists (select 1 from tasks where id = $1 and workspace_id = $2)`,
-		taskID, wsID).Scan(&exists); err != nil {
-		httpx.Fail(w, r, db.MapError(err))
-		return
-	}
-	if !exists {
-		httpx.Fail(w, r, httpx.ErrNotFound)
+	// Confirm the task is in this workspace before the RPC, which takes a bare
+	// task id and is not workspace-scoped on its own.
+	if err := s.assertTaskInWorkspace(r.Context(), taskID, wsID); err != nil {
+		httpx.Fail(w, r, err)
 		return
 	}
 
 	var rank float64
-	if err := s.db.QueryRow(r.Context(),
-		`select move_task($1, $2::task_state, $3, $4, $5)`,
-		taskID, req.State, req.BeforeRank, req.AfterRank, userID).Scan(&rank); err != nil {
-		httpx.Fail(w, r, db.MapError(err))
+	if err := s.data.RPC(r.Context(), "move_task", map[string]any{
+		"p_task":   taskID,
+		"p_state":  req.State,
+		"p_before": req.BeforeRank,
+		"p_after":  req.AfterRank,
+		"p_actor":  userID,
+	}, &rank); err != nil {
+		httpx.Fail(w, r, err)
 		return
 	}
 
@@ -561,13 +522,19 @@ func (s *Server) handleDeleteTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tag, err := s.db.Exec(r.Context(),
-		`delete from tasks where id = $1 and workspace_id = $2`, taskID, wsID)
+	var deleted []struct {
+		ID uuid.UUID `json:"id"`
+	}
+	err = s.data.From("tasks").
+		Select("id").
+		Eq("id", taskID).
+		Eq("workspace_id", wsID).
+		Delete(r.Context(), &deleted)
 	if err != nil {
-		httpx.Fail(w, r, db.MapError(err))
+		httpx.Fail(w, r, err)
 		return
 	}
-	if tag.RowsAffected() == 0 {
+	if len(deleted) == 0 {
 		httpx.Fail(w, r, httpx.ErrNotFound)
 		return
 	}
@@ -589,13 +556,16 @@ func (s *Server) notifyAssignment(ctx context.Context, wsID, actorID uuid.UUID,
 		return
 	}
 
-	_, err := s.db.Exec(ctx, `
-		insert into notifications (workspace_id, user_id, actor_id, kind, title, body, task_id)
-		values ($1, $2, $3, 'assignment', $4, $5, $6)`,
-		wsID, *t.AssigneeID, actorID, "You were assigned "+t.Ref, t.Title, t.ID)
-	if err != nil {
-		return // a missed notification must never fail the write that caused it
-	}
+	// A missed notification must never fail the write that caused it.
+	_ = s.data.From("notifications").Insert(ctx, map[string]any{
+		"workspace_id": wsID,
+		"user_id":      *t.AssigneeID,
+		"actor_id":     actorID,
+		"kind":         "assignment",
+		"title":        "You were assigned " + t.Ref,
+		"body":         t.Title,
+		"task_id":      t.ID,
+	}, nil)
 
 	s.hub.PublishTo(wsID, *t.AssigneeID, realtime.Event{
 		Type:    "notification.new",

@@ -1,32 +1,66 @@
 package api
 
 import (
+	"context"
 	"net/http"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 
-	"github.com/sprintly/sprintly/backend/internal/db"
 	"github.com/sprintly/sprintly/backend/internal/httpx"
 	"github.com/sprintly/sprintly/backend/internal/models"
 	"github.com/sprintly/sprintly/backend/internal/realtime"
 )
 
-const projectSelect = `
-	select p.id, p.workspace_id, p.team_id, p.name, p.key, p.description, p.color, p.icon,
-	       p.start_date, p.target_date, p.archived_at, p.created_at,
-	       coalesce(pp.total_tasks, 0), coalesce(pp.done_tasks, 0),
-	       coalesce(pp.overdue_tasks, 0), pp.percent_complete
-	  from projects p
-	  left join project_progress pp on pp.project_id = p.id`
+// projectCols is the projection behind models.Project's own columns. The
+// counters come from the project_progress view, which is fetched separately —
+// PostgREST can only embed across a foreign key, and a view has none.
+const projectCols = "id,workspace_id,team_id,name,key,description,color,icon," +
+	"start_date,target_date,archived_at,created_at"
 
-func scanProject(row interface{ Scan(...any) error }) (models.Project, error) {
-	var p models.Project
-	err := row.Scan(&p.ID, &p.WorkspaceID, &p.TeamID, &p.Name, &p.Key, &p.Description,
-		&p.Color, &p.Icon, &p.StartDate, &p.TargetDate, &p.ArchivedAt, &p.CreatedAt,
-		&p.TotalTasks, &p.DoneTasks, &p.OverdueTasks, &p.PercentComplete)
-	return p, err
+type projectProgress struct {
+	ProjectID       uuid.UUID `json:"project_id"`
+	TotalTasks      int       `json:"total_tasks"`
+	DoneTasks       int       `json:"done_tasks"`
+	OverdueTasks    int       `json:"overdue_tasks"`
+	PercentComplete *float64  `json:"percent_complete"`
+}
+
+// attachProgress fills the counters on projects in one extra round trip,
+// regardless of how many projects there are.
+func (s *Server) attachProgress(ctx context.Context, projects []models.Project) error {
+	if len(projects) == 0 {
+		return nil
+	}
+	ids := make([]string, len(projects))
+	for i, p := range projects {
+		ids[i] = p.ID.String()
+	}
+
+	var rows []projectProgress
+	if err := s.data.From("project_progress").
+		Select("project_id,total_tasks,done_tasks,overdue_tasks,percent_complete").
+		In("project_id", ids).
+		Get(ctx, &rows); err != nil {
+		return err
+	}
+
+	byID := make(map[uuid.UUID]projectProgress, len(rows))
+	for _, row := range rows {
+		byID[row.ProjectID] = row
+	}
+	for i := range projects {
+		if pp, ok := byID[projects[i].ID]; ok {
+			projects[i].TotalTasks = pp.TotalTasks
+			projects[i].DoneTasks = pp.DoneTasks
+			projects[i].OverdueTasks = pp.OverdueTasks
+			projects[i].PercentComplete = pp.PercentComplete
+		}
+	}
+	return nil
 }
 
 func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
@@ -36,31 +70,46 @@ func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	includeArchived := r.URL.Query().Get("archived") == "true"
-	rows, err := s.db.Query(r.Context(), projectSelect+`
-		 where p.workspace_id = $1 and ($2 or p.archived_at is null)
-		 order by p.archived_at nulls first, p.created_at`, wsID, includeArchived)
-	if err != nil {
-		httpx.Fail(w, r, db.MapError(err))
-		return
+	q := s.data.From("projects").
+		Select(projectCols).
+		Eq("workspace_id", wsID).
+		Order("archived_at", false).
+		Order("created_at", false)
+
+	if r.URL.Query().Get("archived") != "true" {
+		q = q.IsNull("archived_at", true)
 	}
-	defer rows.Close()
 
 	out := []models.Project{}
-	for rows.Next() {
-		p, err := scanProject(rows)
-		if err != nil {
-			httpx.Fail(w, r, db.MapError(err))
-			return
-		}
-		out = append(out, p)
+	if err := q.Get(r.Context(), &out); err != nil {
+		httpx.Fail(w, r, err)
+		return
 	}
-	if err := rows.Err(); err != nil {
-		httpx.Fail(w, r, db.MapError(err))
+	if err := s.attachProgress(r.Context(), out); err != nil {
+		httpx.Fail(w, r, err)
 		return
 	}
 
 	httpx.JSON(w, http.StatusOK, map[string]any{"projects": out})
+}
+
+// getProject reads one project scoped to the workspace. The workspace_id filter
+// is what stops a project UUID from another tenant being readable.
+func (s *Server) getProject(ctx context.Context, projectID, wsID uuid.UUID) (models.Project, error) {
+	var p models.Project
+	if err := s.data.From("projects").
+		Select(projectCols).
+		Eq("id", projectID).
+		Eq("workspace_id", wsID).
+		Single().
+		Get(ctx, &p); err != nil {
+		return p, err
+	}
+	one := []models.Project{p}
+	if err := s.attachProgress(ctx, one); err != nil {
+		return p, err
+	}
+	return one[0], nil
 }
 
 func (s *Server) handleGetProject(w http.ResponseWriter, r *http.Request) {
@@ -75,10 +124,9 @@ func (s *Server) handleGetProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	p, err := scanProject(s.db.QueryRow(r.Context(),
-		projectSelect+` where p.id = $1 and p.workspace_id = $2`, projectID, wsID))
+	p, err := s.getProject(r.Context(), projectID, wsID)
 	if err != nil {
-		httpx.Fail(w, r, db.MapError(err))
+		httpx.Fail(w, r, err)
 		return
 	}
 	httpx.JSON(w, http.StatusOK, p)
@@ -128,23 +176,28 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 		req.Color = "#6366f1"
 	}
 
-	p, err := scanProject(s.db.QueryRow(r.Context(), `
-		with created as (
-		  insert into projects (workspace_id, team_id, name, key, description, color, icon,
-		                        start_date, target_date, created_by)
-		  values ($1, nullif($2,'')::uuid, $3, $4, $5, $6, $7,
-		          nullif($8,'')::date, nullif($9,'')::date, $10)
-		  returning *
-		)
-		select p.id, p.workspace_id, p.team_id, p.name, p.key, p.description, p.color, p.icon,
-		       p.start_date, p.target_date, p.archived_at, p.created_at, 0, 0, 0, null::numeric
-		  from created p`,
-		wsID, derefString(req.TeamID), req.Name, req.Key, req.Description, req.Color, req.Icon,
-		derefString(req.StartDate), derefString(req.TargetDate), userID))
-	if err != nil {
-		httpx.Fail(w, r, db.MapError(err))
+	body := map[string]any{
+		"workspace_id": wsID,
+		"name":         req.Name,
+		"key":          req.Key,
+		"color":        req.Color,
+		"created_by":   userID,
+		"team_id":      nilIfEmpty(derefString(req.TeamID)),
+		"description":  req.Description,
+		"icon":         req.Icon,
+		"start_date":   nilIfEmpty(derefString(req.StartDate)),
+		"target_date":  nilIfEmpty(derefString(req.TargetDate)),
+	}
+
+	var p models.Project
+	if err := s.data.From("projects").
+		Select(projectCols).
+		Single().
+		Insert(r.Context(), body, &p); err != nil {
+		httpx.Fail(w, r, err)
 		return
 	}
+	// A brand new project has no tasks, so the counters are zero by definition.
 
 	s.hub.Publish(realtime.Event{Type: "project.created", WorkspaceID: wsID,
 		ActorID: userID, Payload: realtime.Marshal(p)})
@@ -180,28 +233,50 @@ func (s *Server) handleUpdateProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, err := s.db.Exec(r.Context(), `
-		update projects set
-		  name        = coalesce($3, name),
-		  description = case when $4::text is null then description else nullif($4,'') end,
-		  color       = coalesce($5, color),
-		  icon        = case when $6::text is null then icon else nullif($6,'') end,
-		  team_id     = case when $7::text is null then team_id else nullif($7,'')::uuid end,
-		  start_date  = case when $8::text is null then start_date else nullif($8,'')::date end,
-		  target_date = case when $9::text is null then target_date else nullif($9,'')::date end,
-		  archived_at = case when $10::boolean is null then archived_at
-		                     when $10 then coalesce(archived_at, now()) else null end
-		where id = $1 and workspace_id = $2`,
-		projectID, wsID, req.Name, req.Description, req.Color, req.Icon,
-		req.TeamID, req.StartDate, req.TargetDate, req.Archived); err != nil {
-		httpx.Fail(w, r, db.MapError(err))
-		return
+	patch := map[string]any{}
+	if req.Name != nil {
+		patch["name"] = *req.Name
+	}
+	if req.Color != nil {
+		patch["color"] = *req.Color
+	}
+	if req.Description != nil {
+		patch["description"] = nilIfEmpty(*req.Description)
+	}
+	if req.Icon != nil {
+		patch["icon"] = nilIfEmpty(*req.Icon)
+	}
+	if req.TeamID != nil {
+		patch["team_id"] = nilIfEmpty(strings.TrimSpace(*req.TeamID))
+	}
+	if req.StartDate != nil {
+		patch["start_date"] = nilIfEmpty(strings.TrimSpace(*req.StartDate))
+	}
+	if req.TargetDate != nil {
+		patch["target_date"] = nilIfEmpty(strings.TrimSpace(*req.TargetDate))
+	}
+	if req.Archived != nil {
+		// Archiving twice keeps the original timestamp; unarchiving clears it.
+		if *req.Archived {
+			patch["archived_at"] = time.Now().UTC()
+		} else {
+			patch["archived_at"] = nil
+		}
 	}
 
-	p, err := scanProject(s.db.QueryRow(r.Context(),
-		projectSelect+` where p.id = $1 and p.workspace_id = $2`, projectID, wsID))
+	if len(patch) > 0 {
+		if err := s.data.From("projects").
+			Eq("id", projectID).
+			Eq("workspace_id", wsID).
+			Update(r.Context(), patch, nil); err != nil {
+			httpx.Fail(w, r, err)
+			return
+		}
+	}
+
+	p, err := s.getProject(r.Context(), projectID, wsID)
 	if err != nil {
-		httpx.Fail(w, r, db.MapError(err))
+		httpx.Fail(w, r, err)
 		return
 	}
 

@@ -2,37 +2,37 @@ package api
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/coder/websocket"
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
 
-	"github.com/sprintly/sprintly/backend/internal/db"
 	"github.com/sprintly/sprintly/backend/internal/httpx"
 	"github.com/sprintly/sprintly/backend/internal/models"
 	"github.com/sprintly/sprintly/backend/internal/realtime"
 )
 
-// pgxTx is the subset of pgx.Tx the handlers use, named locally so the query
-// helpers do not have to import pgx everywhere.
-type pgxTx = pgx.Tx
-
 func itoa(n int) string { return strconv.Itoa(n) }
 
-func parseLabels(raw string) []models.Label {
-	out := []models.Label{}
-	if raw == "" {
-		return out
+// nowRFC3339 is what goes into a JSON patch body where SQL would have said
+// now(). PostgREST takes an ISO timestamp for a timestamptz column.
+func nowRFC3339() string { return time.Now().UTC().Format(time.RFC3339Nano) }
+
+// embeddedCount decodes PostgREST's aggregate embedding, which comes back as
+// `"team_members": [{"count": 3}]` — an array even though it holds one row.
+type embeddedCount []struct {
+	Count int `json:"count"`
+}
+
+func (e embeddedCount) value() int {
+	if len(e) == 0 {
+		return 0
 	}
-	if err := json.Unmarshal([]byte(raw), &out); err != nil {
-		return []models.Label{}
-	}
-	return out
+	return e[0].Count
 }
 
 // ---------------------------------------------------------------- teams
@@ -44,29 +44,25 @@ func (s *Server) handleListTeams(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rows, err := s.db.Query(r.Context(), `
-		select t.id, t.workspace_id, t.name, t.description, t.color,
-		       (select count(*) from team_members m where m.team_id = t.id)
-		  from teams t where t.workspace_id = $1 order by t.name`, wsID)
+	var rows []struct {
+		models.Team
+		Members embeddedCount `json:"team_members"`
+	}
+	err = s.data.From("teams").
+		Select("id,workspace_id,name,description,color,team_members(count)").
+		Eq("workspace_id", wsID).
+		Order("name", false).
+		Get(r.Context(), &rows)
 	if err != nil {
-		httpx.Fail(w, r, db.MapError(err))
+		httpx.Fail(w, r, err)
 		return
 	}
-	defer rows.Close()
 
-	out := []models.Team{}
-	for rows.Next() {
-		var t models.Team
-		if err := rows.Scan(&t.ID, &t.WorkspaceID, &t.Name, &t.Description,
-			&t.Color, &t.MemberCount); err != nil {
-			httpx.Fail(w, r, db.MapError(err))
-			return
-		}
+	out := make([]models.Team, 0, len(rows))
+	for _, row := range rows {
+		t := row.Team
+		t.MemberCount = row.Members.value()
 		out = append(out, t)
-	}
-	if err := rows.Err(); err != nil {
-		httpx.Fail(w, r, db.MapError(err))
-		return
 	}
 
 	httpx.JSON(w, http.StatusOK, map[string]any{"teams": out})
@@ -79,6 +75,10 @@ type createTeamRequest struct {
 	MemberIDs   []uuid.UUID `json:"member_ids,omitempty"`
 }
 
+// handleCreateTeam goes through an RPC because it is two writes that must not
+// half-apply, and because the member insert is a SELECT-driven INSERT that
+// filters the requested ids down to actual active workspace members — neither
+// of which PostgREST can express.
 func (s *Server) handleCreateTeam(w http.ResponseWriter, r *http.Request) {
 	userID, wsID, _, err := s.ctxIDs(r)
 	if err != nil {
@@ -105,32 +105,25 @@ func (s *Server) handleCreateTeam(w http.ResponseWriter, r *http.Request) {
 		req.MemberIDs = append(req.MemberIDs, userID)
 	}
 
-	var t models.Team
-	err = s.db.InTx(r.Context(), func(tx pgxTx) error {
-		if err := tx.QueryRow(r.Context(), `
-			insert into teams (workspace_id, name, description, color)
-			values ($1, $2, nullif($3,''), $4)
-			returning id, workspace_id, name, description, color`,
-			wsID, req.Name, derefString(req.Description), req.Color,
-		).Scan(&t.ID, &t.WorkspaceID, &t.Name, &t.Description, &t.Color); err != nil {
-			return err
-		}
+	ids := make([]string, len(req.MemberIDs))
+	for i, id := range req.MemberIDs {
+		ids[i] = id.String()
+	}
 
-		// Only actual workspace members may be added.
-		_, err := tx.Exec(r.Context(), `
-			insert into team_members (team_id, user_id, is_lead)
-			select $1, m.user_id, m.user_id = $3
-			  from workspace_members m
-			 where m.workspace_id = $4 and m.status = 'active' and m.user_id = any($2::uuid[])
-			on conflict do nothing`, t.ID, req.MemberIDs, userID, wsID)
-		return err
-	})
+	var t models.Team
+	err = s.data.RPCSingle(r.Context(), "create_team", map[string]any{
+		"p_workspace":   wsID,
+		"p_name":        req.Name,
+		"p_description": nilIfEmpty(derefString(req.Description)),
+		"p_color":       req.Color,
+		"p_lead":        userID,
+		"p_members":     ids,
+	}, &t)
 	if err != nil {
-		httpx.Fail(w, r, db.MapError(err))
+		httpx.Fail(w, r, err)
 		return
 	}
 
-	t.MemberCount = len(req.MemberIDs)
 	s.hub.Publish(realtime.Event{Type: "team.created", WorkspaceID: wsID,
 		ActorID: userID, Payload: realtime.Marshal(t)})
 	httpx.JSON(w, http.StatusCreated, t)
@@ -145,25 +138,14 @@ func (s *Server) handleListLabels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rows, err := s.db.Query(r.Context(),
-		`select id, name, color from labels where workspace_id = $1 order by name`, wsID)
-	if err != nil {
-		httpx.Fail(w, r, db.MapError(err))
-		return
-	}
-	defer rows.Close()
-
 	out := []models.Label{}
-	for rows.Next() {
-		var l models.Label
-		if err := rows.Scan(&l.ID, &l.Name, &l.Color); err != nil {
-			httpx.Fail(w, r, db.MapError(err))
-			return
-		}
-		out = append(out, l)
-	}
-	if err := rows.Err(); err != nil {
-		httpx.Fail(w, r, db.MapError(err))
+	err = s.data.From("labels").
+		Select("id,name,color").
+		Eq("workspace_id", wsID).
+		Order("name", false).
+		Get(r.Context(), &out)
+	if err != nil {
+		httpx.Fail(w, r, err)
 		return
 	}
 
@@ -197,11 +179,14 @@ func (s *Server) handleCreateLabel(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var l models.Label
-	if err := s.db.QueryRow(r.Context(), `
-		insert into labels (workspace_id, name, color) values ($1, $2, $3)
-		returning id, name, color`, wsID, req.Name, req.Color,
-	).Scan(&l.ID, &l.Name, &l.Color); err != nil {
-		httpx.Fail(w, r, db.MapError(err))
+	err = s.data.From("labels").
+		Select("id,name,color").
+		Single().
+		Insert(r.Context(), map[string]any{
+			"workspace_id": wsID, "name": req.Name, "color": req.Color,
+		}, &l)
+	if err != nil {
+		httpx.Fail(w, r, err)
 		return
 	}
 
@@ -210,6 +195,12 @@ func (s *Server) handleCreateLabel(w http.ResponseWriter, r *http.Request) {
 
 // ---------------------------------------------------------------- notifications
 
+// notificationRow is a notification plus its embedded actor profile.
+type notificationRow struct {
+	models.Notification
+	ActorProfile *models.Profile `json:"profiles"`
+}
+
 func (s *Server) handleListNotifications(w http.ResponseWriter, r *http.Request) {
 	userID, wsID, _, err := s.ctxIDs(r)
 	if err != nil {
@@ -217,54 +208,38 @@ func (s *Server) handleListNotifications(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	unreadOnly := r.URL.Query().Get("unread") == "true"
-	rows, err := s.db.Query(r.Context(), `
-		select n.id, n.kind, n.title, n.body, n.task_id, n.url, n.read_at, n.created_at,
-		       p.id, p.email, p.full_name, p.avatar_url, p.presence
-		  from notifications n
-		  left join profiles p on p.id = n.actor_id
-		 where n.workspace_id = $1 and n.user_id = $2
-		   and (not $3 or n.read_at is null)
-		 order by n.created_at desc
-		 limit $4`, wsID, userID, unreadOnly, httpx.QueryInt(r, "limit", 50, 200))
-	if err != nil {
-		httpx.Fail(w, r, db.MapError(err))
+	q := s.data.From("notifications").
+		Select("id,kind,title,body,task_id,url,read_at,created_at,"+
+			"profiles!notifications_actor_id_fkey(id,email,full_name,avatar_url,presence)").
+		Eq("workspace_id", wsID).
+		Eq("user_id", userID).
+		Order("created_at", true).
+		Limit(httpx.QueryInt(r, "limit", 50, 200))
+
+	if r.URL.Query().Get("unread") == "true" {
+		q = q.IsNull("read_at", true)
+	}
+
+	var rows []notificationRow
+	if err := q.Get(r.Context(), &rows); err != nil {
+		httpx.Fail(w, r, err)
 		return
 	}
-	defer rows.Close()
 
-	out := []models.Notification{}
-	for rows.Next() {
-		var (
-			n      models.Notification
-			id     *uuid.UUID
-			email  *string
-			name   *string
-			avatar *string
-			pres   *string
-		)
-		if err := rows.Scan(&n.ID, &n.Kind, &n.Title, &n.Body, &n.TaskID, &n.URL,
-			&n.ReadAt, &n.CreatedAt, &id, &email, &name, &avatar, &pres); err != nil {
-			httpx.Fail(w, r, db.MapError(err))
-			return
-		}
-		if id != nil {
-			n.Actor = &models.Profile{ID: *id, Email: deref(email), FullName: name,
-				AvatarURL: avatar, Presence: deref(pres)}
-		}
+	out := make([]models.Notification, 0, len(rows))
+	for _, row := range rows {
+		n := row.Notification
+		n.Actor = row.ActorProfile
 		out = append(out, n)
 	}
-	if err := rows.Err(); err != nil {
-		httpx.Fail(w, r, db.MapError(err))
-		return
-	}
 
-	var unread int
-	if err := s.db.QueryRow(r.Context(),
-		`select count(*) from notifications
-		  where workspace_id = $1 and user_id = $2 and read_at is null`,
-		wsID, userID).Scan(&unread); err != nil {
-		httpx.Fail(w, r, db.MapError(err))
+	unread, err := s.data.From("notifications").
+		Eq("workspace_id", wsID).
+		Eq("user_id", userID).
+		IsNull("read_at", true).
+		Count(r.Context())
+	if err != nil {
+		httpx.Fail(w, r, err)
 		return
 	}
 
@@ -291,17 +266,31 @@ func (s *Server) handleMarkNotificationsRead(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	tag, err := s.db.Exec(r.Context(), `
-		update notifications set read_at = now()
-		 where workspace_id = $1 and user_id = $2 and read_at is null
-		   and (cardinality($3::bigint[]) = 0 or id = any($3::bigint[]))`,
-		wsID, userID, req.IDs)
-	if err != nil {
-		httpx.Fail(w, r, db.MapError(err))
+	q := s.data.From("notifications").
+		Select("id").
+		Eq("workspace_id", wsID).
+		Eq("user_id", userID).
+		IsNull("read_at", true)
+
+	if len(req.IDs) > 0 {
+		ids := make([]string, len(req.IDs))
+		for i, id := range req.IDs {
+			ids[i] = strconv.FormatInt(id, 10)
+		}
+		q = q.In("id", ids)
+	}
+
+	// return=representation gives back the affected rows, which is how the count
+	// is obtained without a command tag.
+	var marked []struct {
+		ID int64 `json:"id"`
+	}
+	if err := q.Update(r.Context(), map[string]any{"read_at": nowRFC3339()}, &marked); err != nil {
+		httpx.Fail(w, r, err)
 		return
 	}
 
-	httpx.JSON(w, http.StatusOK, map[string]any{"marked": tag.RowsAffected()})
+	httpx.JSON(w, http.StatusOK, map[string]any{"marked": len(marked)})
 }
 
 // ---------------------------------------------------------------- websocket

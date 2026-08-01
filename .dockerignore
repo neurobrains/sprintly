@@ -17,7 +17,6 @@ supabase/
 .gitattributes
 
 # ----------------------------------------------------------------- docs
-docs/
 *.md
 LICENSE
 
@@ -25,10 +24,6 @@ LICENSE
 .env
 .env.*
 !.env.example
-docker-compose.yml
-docker-compose.*.yml
-Makefile
-.editorconfig
 
 # ----------------------------------------------------------------- build output
 backend/server

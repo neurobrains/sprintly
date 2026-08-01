@@ -17,6 +17,7 @@
 --   5. Time          time entries, availability, workload views
 --   6. Security      row level security policies + realtime publication
 --   7. RPCs          onboarding, join requests, board moves
+--   8. API RPCs      everything the Go API calls that PostgREST cannot express
 --
 -- It does NOT drop tables or data. To start from scratch, drop the public
 -- schema first:  drop schema public cascade; create schema public;
@@ -1226,3 +1227,361 @@ begin
 
   return new_rank;
 end $$;
+
+
+-- ==========================================================================
+-- 8. API RPCs
+-- ==========================================================================
+--
+-- The Go API reaches Postgres through PostgREST with the service role key —
+-- there is no database password in the deployment, so there is no connection
+-- pool. PostgREST covers plain CRUD; everything below is what it cannot express:
+--
+--   * multi-statement writes that must not half-apply (no client transactions)
+--   * correlated aggregates that would otherwise become one HTTP call per row
+--   * ordering by a rank that is not a column (role seniority, priority)
+--   * matching one input against a uuid, a join code and a slug at once
+--
+-- Naming contract: every output column is named to match the JSON tag on the
+-- corresponding Go struct in internal/models, so responses decode straight
+-- through. Renaming a column here silently drops a field there.
+--
+-- All of these are SECURITY DEFINER and take the caller's identity as an
+-- argument. They do NOT check authorization — the Go API already did that in
+-- requireWorkspace/requireRole. They are revoked from the browser roles below.
+
+-- ---------------------------------------------------------------- profiles
+
+-- Conditional merge: the JWT refreshes the email and fills in blanks, but a
+-- full_name the user has since edited wins over the one Google supplies.
+create or replace function upsert_profile(
+  p_id uuid, p_email text, p_name text default null, p_avatar text default null
+) returns setof profiles
+language plpgsql security definer set search_path = public as $fn$
+begin
+  return query
+  insert into profiles (id, email, full_name, avatar_url)
+  values (p_id, coalesce(p_email, ''), nullif(btrim(coalesce(p_name, '')), ''),
+          nullif(btrim(coalesce(p_avatar, '')), ''))
+  on conflict (id) do update
+     set email        = excluded.email,
+         full_name    = coalesce(profiles.full_name, excluded.full_name),
+         avatar_url   = coalesce(excluded.avatar_url, profiles.avatar_url),
+         last_seen_at = now(),
+         updated_at   = now()
+  returning *;
+end $fn$;
+
+-- ---------------------------------------------------------------- account
+
+create or replace function my_workspaces(p_user uuid)
+returns table (
+  id uuid, name text, slug text, join_code text, join_policy join_policy,
+  logo_url text, created_by uuid, created_at timestamptz,
+  role workspace_role, member_count bigint
+)
+language sql stable security definer set search_path = public as $fn$
+  select w.id, w.name, w.slug,
+         -- The join code is a credential; only managers and above get it.
+         case when m.role in ('owner','admin','manager') then w.join_code else '' end,
+         w.join_policy, w.logo_url, w.created_by, w.created_at,
+         m.role,
+         (select count(*) from workspace_members x
+           where x.workspace_id = w.id and x.status = 'active')
+    from workspaces w
+    join workspace_members m on m.workspace_id = w.id
+   where m.user_id = p_user and m.status = 'active'
+   order by w.created_at
+$fn$;
+
+-- Cross-workspace "My Work". Due date first, then priority rank, then age.
+create or replace function my_tasks(p_user uuid, p_limit int default 100)
+returns table (
+  id uuid, workspace_id uuid, project_id uuid, project_key text, number int,
+  title text, state task_state, priority task_priority,
+  due_date timestamptz, estimate_hours numeric,
+  workspace_slug text, workspace_name text
+)
+language sql stable security definer set search_path = public as $fn$
+  select t.id, t.workspace_id, t.project_id, p.key, t.number, t.title,
+         t.state, t.priority, t.due_date, t.estimate_hours, w.slug, w.name
+    from tasks t
+    join projects   p on p.id = t.project_id
+    join workspaces w on w.id = t.workspace_id
+    join workspace_members m
+      on m.workspace_id = t.workspace_id and m.user_id = p_user and m.status = 'active'
+   where t.assignee_id = p_user and t.state not in ('done','cancelled')
+   order by t.due_date nulls last,
+            array_position(array['urgent','high','medium','low','none'], t.priority::text),
+            t.created_at
+   limit p_limit
+$fn$;
+
+-- ---------------------------------------------------------------- workspaces
+
+-- One input, three normalisations: raw uuid, dash-stripped upper join code, or
+-- lowercase slug. Deliberately returns no join_code — it feeds the pre-join
+-- preview screen, which is reachable by anyone holding a code.
+create or replace function lookup_workspace(p_reference text)
+returns table (
+  id uuid, name text, slug text, join_policy join_policy,
+  logo_url text, member_count bigint
+)
+language plpgsql stable security definer set search_path = public as $fn$
+declare ref text := btrim(p_reference); as_uuid uuid;
+begin
+  begin
+    as_uuid := ref::uuid;
+  exception when invalid_text_representation then
+    as_uuid := null;
+  end;
+
+  return query
+  select w.id, w.name, w.slug, w.join_policy, w.logo_url,
+         (select count(*) from workspace_members m
+           where m.workspace_id = w.id and m.status = 'active')
+    from workspaces w
+   where (as_uuid is not null and w.id = as_uuid)
+      or w.join_code = upper(replace(ref, '-', ''))
+      or w.slug = lower(ref)
+   limit 1;
+end $fn$;
+
+create or replace function rotate_join_code(p_workspace uuid) returns text
+language plpgsql security definer set search_path = public as $fn$
+declare code text;
+begin
+  update workspaces set join_code = gen_join_code(), updated_at = now()
+   where id = p_workspace
+  returning join_code into code;
+
+  if code is null then
+    raise exception 'workspace not found' using errcode = 'no_data_found';
+  end if;
+  return code;
+end $fn$;
+
+-- ---------------------------------------------------------------- teams
+
+-- Two writes in one transaction. The member insert filters the requested ids
+-- down to people who are actually active members of this workspace, so a caller
+-- cannot add strangers by guessing uuids.
+create or replace function create_team(
+  p_workspace uuid, p_name text, p_color text, p_lead uuid,
+  p_members text[] default '{}', p_description text default null
+) returns table (
+  id uuid, workspace_id uuid, name text, description text,
+  color text, member_count bigint
+)
+language plpgsql security definer set search_path = public as $fn$
+declare new_id uuid;
+begin
+  insert into teams (workspace_id, name, description, color)
+  values (p_workspace, p_name, p_description, p_color)
+  returning teams.id into new_id;
+
+  insert into team_members (team_id, user_id, is_lead)
+  select new_id, m.user_id, m.user_id = p_lead
+    from workspace_members m
+   where m.workspace_id = p_workspace
+     and m.status = 'active'
+     and m.user_id = any (select nullif(x, '')::uuid from unnest(p_members) x)
+  on conflict do nothing;
+
+  return query
+  select t.id, t.workspace_id, t.name, t.description, t.color,
+         (select count(*) from team_members tm where tm.team_id = t.id)
+    from teams t where t.id = new_id;
+end $fn$;
+
+-- ---------------------------------------------------------------- tasks
+
+-- task_row is the projection behind models.Task. Every board view goes through
+-- it, so the five aggregates are correlated sub-queries over covered indexes:
+-- one round trip for the whole board, instead of one HTTP call per card per
+-- count, which is what the same thing costs over plain PostgREST.
+create or replace view task_row as
+select
+  t.id, t.workspace_id, t.project_id, pr.key as project_key, t.parent_id,
+  t.number, t.title, t.description, t.state, t.priority, t.board_rank,
+  t.assignee_id, t.reporter_id, t.start_date, t.due_date, t.estimate_hours,
+  t.completed_at, t.created_at, t.updated_at,
+  case when a.id is null then null else
+    jsonb_build_object('id', a.id, 'email', a.email, 'full_name', a.full_name,
+                       'avatar_url', a.avatar_url, 'presence', a.presence,
+                       'timezone', a.timezone, 'presence_note', a.presence_note,
+                       'last_seen_at', a.last_seen_at)
+  end as assignee,
+  (select count(*) from tasks c where c.parent_id = t.id)                      as subtask_count,
+  (select count(*) from tasks c where c.parent_id = t.id and c.state = 'done') as subtask_done,
+  (select count(*) from comments c where c.task_id = t.id)                     as comment_count,
+  (select count(*) from task_dependencies d
+     join tasks bt on bt.id = d.source_id
+    where d.target_id = t.id and d.kind = 'blocks' and bt.state <> 'done')     as blocked_by,
+  (select coalesce(sum(te.duration_seconds), 0)::int
+     from time_entries te where te.task_id = t.id)                             as logged_seconds,
+  coalesce(
+    (select jsonb_agg(jsonb_build_object('id', l.id, 'name', l.name, 'color', l.color)
+                      order by l.name)
+       from task_labels tl join labels l on l.id = tl.label_id
+      where tl.task_id = t.id), '[]'::jsonb)                                   as labels
+from tasks t
+join projects pr on pr.id = t.project_id
+left join profiles a on a.id = t.assignee_id;
+
+create or replace function task_detail(p_workspace uuid, p_task uuid)
+returns setof task_row
+language sql stable security definer set search_path = public as $fn$
+  select * from task_row where workspace_id = p_workspace and id = p_task
+$fn$;
+
+-- Every filter is optional; a null argument drops out of the WHERE clause.
+create or replace function task_list(
+  p_workspace    uuid,
+  p_project      uuid    default null,
+  p_assignee     uuid    default null,
+  p_unassigned   boolean default false,
+  p_states       text[]  default null,
+  p_priorities   text[]  default null,
+  p_search       text    default null,
+  p_parent       uuid    default null,
+  p_top_level    boolean default false,
+  p_due_before   timestamptz default null,
+  p_due_after    timestamptz default null,
+  p_include_done boolean default false,
+  p_limit        int     default 500
+) returns setof task_row
+language sql stable security definer set search_path = public as $fn$
+  select *
+    from task_row t
+   where t.workspace_id = p_workspace
+     and (p_project    is null or t.project_id  = p_project)
+     and (p_assignee   is null or t.assignee_id = p_assignee)
+     and (not p_unassigned     or t.assignee_id is null)
+     and (p_states     is null or t.state::text    = any (p_states))
+     and (p_priorities is null or t.priority::text = any (p_priorities))
+     and (p_search     is null or t.title ilike '%' || p_search || '%')
+     and (p_parent     is null or t.parent_id = p_parent)
+     and (not p_top_level      or t.parent_id is null)
+     and (p_due_before is null or t.due_date < p_due_before)
+     and (p_due_after  is null or t.due_date >= p_due_after)
+     -- An explicit state filter overrides the default hiding of cancelled work.
+     and (p_include_done or p_states is not null or t.state <> 'cancelled')
+   order by t.state, t.board_rank, t.created_at
+   limit p_limit
+$fn$;
+
+-- The row, its labels and the "created" activity in one transaction. The new
+-- card's board_rank is derived from the current minimum in its column, which
+-- must be read and written atomically or two simultaneous creates collide.
+create or replace function create_task(
+  p_workspace uuid, p_project uuid, p_title text, p_reporter uuid,
+  p_state task_state default 'backlog', p_priority task_priority default 'none',
+  p_parent uuid default null, p_desc text default null, p_assignee uuid default null,
+  p_start timestamptz default null, p_due timestamptz default null,
+  p_estimate numeric default null, p_labels text[] default '{}'
+) returns uuid
+language plpgsql security definer set search_path = public as $fn$
+declare new_id uuid;
+begin
+  -- Scopes the project to the caller's workspace. Without it a project uuid
+  -- from another tenant would be accepted.
+  if not exists (select 1 from projects p
+                  where p.id = p_project and p.workspace_id = p_workspace) then
+    raise exception 'project not found in this workspace' using errcode = 'no_data_found';
+  end if;
+
+  insert into tasks (workspace_id, project_id, parent_id, title, description, state,
+                     priority, assignee_id, reporter_id, start_date, due_date,
+                     estimate_hours, board_rank)
+  values (p_workspace, p_project, p_parent, p_title, p_desc, p_state,
+          p_priority, p_assignee, p_reporter, p_start, p_due, p_estimate,
+          coalesce((select min(board_rank) from tasks
+                     where project_id = p_project and state = p_state), 131072) / 2)
+  returning id into new_id;
+
+  perform set_task_labels(new_id, p_workspace, p_labels);
+
+  insert into activities (workspace_id, task_id, project_id, actor_id, verb)
+  values (p_workspace, new_id, p_project, p_reporter, 'created');
+
+  return new_id;
+end $fn$;
+
+-- Replaces the whole label set. Ids that do not belong to this workspace are
+-- dropped rather than erroring, so a stale client cannot probe for the
+-- existence of another workspace's labels.
+create or replace function set_task_labels(
+  p_task uuid, p_workspace uuid, p_labels text[]
+) returns void
+language plpgsql security definer set search_path = public as $fn$
+begin
+  delete from task_labels where task_id = p_task;
+
+  if p_labels is null or cardinality(p_labels) = 0 then
+    return;
+  end if;
+
+  insert into task_labels (task_id, label_id)
+  select p_task, l.id
+    from labels l
+   where l.workspace_id = p_workspace
+     and l.id = any (select nullif(x, '')::uuid from unnest(p_labels) x)
+  on conflict do nothing;
+end $fn$;
+
+-- Both edge directions in one result. Which task to join to depends on which
+-- end of the edge p_task sits on, so this cannot be a plain filter.
+create or replace function task_dependency_list(p_task uuid, p_workspace uuid)
+returns table (
+  id uuid, source_id uuid, target_id uuid, kind dependency_kind,
+  title text, project_key text, number int, state task_state, direction text
+)
+language sql stable security definer set search_path = public as $fn$
+  select d.id, d.source_id, d.target_id, d.kind,
+         other.title, op.key, other.number, other.state,
+         case when d.target_id = p_task then 'incoming' else 'outgoing' end
+    from task_dependencies d
+    join tasks other
+      on other.id = case when d.target_id = p_task then d.source_id else d.target_id end
+    join projects op on op.id = other.project_id
+   where d.workspace_id = p_workspace
+     and (d.source_id = p_task or d.target_id = p_task)
+   order by d.created_at
+$fn$;
+
+-- ---------------------------------------------------------------- exposure
+--
+-- Everything above runs under the service role key, which bypasses RLS and is
+-- never sent to a browser. PostgREST would otherwise publish every function in
+-- the public schema, so the browser-facing roles are revoked explicitly — these
+-- are SECURITY DEFINER and check no authorization of their own.
+do $grant$
+declare fn text;
+begin
+  foreach fn in array array[
+    'upsert_profile','my_workspaces','my_tasks','lookup_workspace',
+    'rotate_join_code','create_team','task_detail','task_list',
+    'create_task','set_task_labels','task_dependency_list',
+    'create_workspace','join_workspace','decide_join_request','move_task'
+  ] loop
+    begin
+      execute format('revoke all on function %I from anon, authenticated', fn);
+    exception when others then
+      null; -- absent role or overload mismatch: not fatal
+    end;
+  end loop;
+end $grant$;
+
+-- task_row is reachable through PostgREST as a table. It carries no
+-- workspace filter of its own, so it must not be readable by a browser session.
+do $revoke$
+begin
+  execute 'revoke all on task_row from anon, authenticated';
+exception when others then
+  null;
+end $revoke$;
+
+-- PostgREST caches the schema; new functions stay invisible until it reloads.
+-- This is the same thing the dashboard's "Reload schema cache" button does.
+notify pgrst, 'reload schema';
