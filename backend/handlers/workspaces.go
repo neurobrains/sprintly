@@ -1,4 +1,4 @@
-package api
+package handlers
 
 import (
 	"context"
@@ -9,10 +9,10 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
-	"github.com/sprintly/sprintly/backend/internal/auth"
-	"github.com/sprintly/sprintly/backend/internal/httpx"
-	"github.com/sprintly/sprintly/backend/internal/models"
-	"github.com/sprintly/sprintly/backend/internal/realtime"
+	"github.com/sprintly/sprintly/backend/httpx"
+	"github.com/sprintly/sprintly/backend/middleware"
+	"github.com/sprintly/sprintly/backend/models"
+	"github.com/sprintly/sprintly/backend/realtime"
 )
 
 const workspaceCols = "id,name,slug,join_code,join_policy,logo_url,created_by,created_at"
@@ -33,7 +33,7 @@ type createWorkspaceRequest struct {
 // That mattered under pgx and matters more now: over PostgREST there is no
 // client-side transaction to fall back on.
 func (s *Server) handleCreateWorkspace(w http.ResponseWriter, r *http.Request) {
-	user, err := auth.UserFrom(r.Context())
+	user, err := middleware.UserFrom(r.Context())
 	if err != nil {
 		httpx.Fail(w, r, err)
 		return
@@ -100,7 +100,7 @@ type joinWorkspaceRequest struct {
 //   - request     -> status "pending", admins are notified to approve
 //   - invite_only -> 403
 func (s *Server) handleJoinWorkspace(w http.ResponseWriter, r *http.Request) {
-	user, err := auth.UserFrom(r.Context())
+	user, err := middleware.UserFrom(r.Context())
 	if err != nil {
 		httpx.Fail(w, r, err)
 		return
@@ -618,7 +618,7 @@ func (s *Server) handleDecideJoinRequest(w http.ResponseWriter, r *http.Request)
 // ensureProfile guarantees a profiles row exists before anything references it.
 // Same RPC as /me, so the conditional merge (an existing full_name is not
 // clobbered by the JWT's) is defined in exactly one place.
-func (s *Server) ensureProfile(ctx context.Context, user *auth.User) error {
+func (s *Server) ensureProfile(ctx context.Context, user *middleware.User) error {
 	var p models.Profile
 	return s.data.RPCSingle(ctx, "upsert_profile", map[string]any{
 		"p_id":     user.ID,

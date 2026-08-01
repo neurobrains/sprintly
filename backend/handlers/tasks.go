@@ -1,4 +1,4 @@
-package api
+package handlers
 
 import (
 	"context"
@@ -9,9 +9,9 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
-	"github.com/sprintly/sprintly/backend/internal/httpx"
-	"github.com/sprintly/sprintly/backend/internal/models"
-	"github.com/sprintly/sprintly/backend/internal/realtime"
+	"github.com/sprintly/sprintly/backend/httpx"
+	"github.com/sprintly/sprintly/backend/models"
+	"github.com/sprintly/sprintly/backend/realtime"
 )
 
 // Task reads go through the task_list / task_detail RPCs rather than PostgREST

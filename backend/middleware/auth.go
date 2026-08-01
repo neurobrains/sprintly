@@ -1,6 +1,6 @@
-// Package auth verifies Supabase access tokens and attaches the caller's
+// Package middleware verifies Supabase access tokens and attaches the caller's
 // identity and workspace role to the request context.
-package auth
+package middleware
 
 import (
 	"context"
@@ -12,8 +12,8 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 
-	"github.com/sprintly/sprintly/backend/internal/config"
-	"github.com/sprintly/sprintly/backend/internal/httpx"
+	"github.com/sprintly/sprintly/backend/config"
+	"github.com/sprintly/sprintly/backend/httpx"
 )
 
 type ctxKey int

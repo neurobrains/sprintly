@@ -1,11 +1,11 @@
-package supa
+package db
 
 import (
 	"encoding/json"
 	"net/http"
 	"strings"
 
-	"github.com/sprintly/sprintly/backend/internal/httpx"
+	"github.com/sprintly/sprintly/backend/httpx"
 )
 
 // restError is PostgREST's error body. `code` is the Postgres SQLSTATE for

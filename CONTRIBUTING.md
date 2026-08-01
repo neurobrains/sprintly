@@ -126,7 +126,7 @@ Go 1.24, [chi](https://github.com/go-chi/chi) for routing,
 
 ```bash
 cd backend
-go run ./cmd/server
+go run .
 go test -race ./...
 ```
 

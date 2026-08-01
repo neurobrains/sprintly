@@ -1,4 +1,4 @@
-// Package supa is Sprintly's data layer: a small PostgREST client that talks to
+// Package db is Sprintly's data layer: a small PostgREST client that talks to
 // Supabase's REST endpoint with the service role key.
 //
 // Why this instead of a Postgres connection: the deployment only ever holds the
@@ -17,7 +17,7 @@
 //     Anything that must not half-apply belongs in a SECURITY DEFINER function in
 //     supabase/schema.sql, called through RPC — which is where create_workspace,
 //     join_workspace, decide_join_request and move_task already live.
-package supa
+package db
 
 import (
 	"bytes"

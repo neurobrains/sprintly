@@ -1,5 +1,5 @@
-// Package api wires the HTTP surface: routing, middleware, and handlers.
-package api
+// Package handlers wires the HTTP surface: routing, middleware, and handlers.
+package handlers
 
 import (
 	"context"
@@ -8,40 +8,40 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/chi/v5/middleware"
+	chimw "github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/cors"
 	"github.com/google/uuid"
 
-	"github.com/sprintly/sprintly/backend/internal/auth"
-	"github.com/sprintly/sprintly/backend/internal/config"
-	"github.com/sprintly/sprintly/backend/internal/httpx"
-	"github.com/sprintly/sprintly/backend/internal/realtime"
-	"github.com/sprintly/sprintly/backend/internal/supa"
+	"github.com/sprintly/sprintly/backend/config"
+	"github.com/sprintly/sprintly/backend/db"
+	"github.com/sprintly/sprintly/backend/httpx"
+	"github.com/sprintly/sprintly/backend/middleware"
+	"github.com/sprintly/sprintly/backend/realtime"
 )
 
 type Server struct {
 	cfg      *config.Config
-	data     *supa.Client
-	verifier *auth.Verifier
+	data     *db.Client
+	verifier *middleware.Verifier
 	hub      *realtime.Hub
 }
 
-// supaQuery lets handlers pass a partly-built query around without every file
-// importing the supa package.
-type supaQuery = supa.Query
+// dbQuery lets handlers pass a partly-built query around without every file
+// importing the db package.
+type dbQuery = db.Query
 
-func NewServer(cfg *config.Config, data *supa.Client, hub *realtime.Hub) *Server {
-	return &Server{cfg: cfg, data: data, verifier: auth.NewVerifier(cfg), hub: hub}
+func NewServer(cfg *config.Config, data *db.Client, hub *realtime.Hub) *Server {
+	return &Server{cfg: cfg, data: data, verifier: middleware.NewVerifier(cfg), hub: hub}
 }
 
 func (s *Server) Routes() http.Handler {
 	r := chi.NewRouter()
 
-	r.Use(middleware.RequestID)
-	r.Use(middleware.RealIP)
+	r.Use(chimw.RequestID)
+	r.Use(chimw.RealIP)
 	r.Use(requestLogger)
-	r.Use(middleware.Recoverer)
-	r.Use(middleware.Timeout(30 * time.Second))
+	r.Use(chimw.Recoverer)
+	r.Use(chimw.Timeout(30 * time.Second))
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   s.cfg.AllowedOrigins,
 		AllowedMethods:   []string{"GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"},
@@ -152,7 +152,7 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 // endpoint cannot be used to probe which workspaces exist.
 func (s *Server) requireWorkspace(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		user, err := auth.UserFrom(r.Context())
+		user, err := middleware.UserFrom(r.Context())
 		if err != nil {
 			httpx.Fail(w, r, err)
 			return
@@ -195,7 +195,7 @@ func (s *Server) requireWorkspace(next http.Handler) http.Handler {
 			return
 		}
 
-		ctx := auth.WithMembership(r.Context(), &auth.Membership{
+		ctx := middleware.WithMembership(r.Context(), &middleware.Membership{
 			WorkspaceID: wsID, Role: role, Status: status,
 		})
 		next.ServeHTTP(w, r.WithContext(ctx))
@@ -206,7 +206,7 @@ func (s *Server) requireWorkspace(next http.Handler) http.Handler {
 func (s *Server) requireRole(minimum string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			m, err := auth.MembershipFrom(r.Context())
+			m, err := middleware.MembershipFrom(r.Context())
 			if err != nil {
 				httpx.Fail(w, r, err)
 				return
@@ -229,7 +229,7 @@ func (s *Server) denyGuest(next http.Handler) http.Handler {
 func requestLogger(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
+		ww := chimw.NewWrapResponseWriter(w, r.ProtoMajor)
 		next.ServeHTTP(ww, r)
 
 		level := slog.LevelInfo
@@ -242,18 +242,18 @@ func requestLogger(next http.Handler) http.Handler {
 			"status", ww.Status(),
 			"bytes", ww.BytesWritten(),
 			"duration_ms", time.Since(start).Milliseconds(),
-			"request_id", middleware.GetReqID(r.Context()),
+			"request_id", chimw.GetReqID(r.Context()),
 		)
 	})
 }
 
 // ctxIDs is the pair every workspace-scoped handler needs.
 func (s *Server) ctxIDs(r *http.Request) (userID, workspaceID uuid.UUID, role string, err error) {
-	user, err := auth.UserFrom(r.Context())
+	user, err := middleware.UserFrom(r.Context())
 	if err != nil {
 		return uuid.Nil, uuid.Nil, "", err
 	}
-	m, err := auth.MembershipFrom(r.Context())
+	m, err := middleware.MembershipFrom(r.Context())
 	if err != nil {
 		return uuid.Nil, uuid.Nil, "", err
 	}

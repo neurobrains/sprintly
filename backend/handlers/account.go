@@ -1,17 +1,17 @@
-package api
+package handlers
 
 import (
 	"net/http"
 	"time"
 
-	"github.com/sprintly/sprintly/backend/internal/auth"
-	"github.com/sprintly/sprintly/backend/internal/httpx"
-	"github.com/sprintly/sprintly/backend/internal/models"
+	"github.com/sprintly/sprintly/backend/httpx"
+	"github.com/sprintly/sprintly/backend/middleware"
+	"github.com/sprintly/sprintly/backend/models"
 )
 
 // handleMe returns the caller's profile, upserting it from the JWT first.
 //
-// The auth.users trigger normally creates the row, but a project restored from a
+// The middleware.users trigger normally creates the row, but a project restored from a
 // dump or a user created before the trigger existed would have none. Doing it
 // here makes /me the reliable "ensure I exist" call the frontend makes on boot.
 //
@@ -20,7 +20,7 @@ import (
 // renamed themselves is not overwritten on every sign-in. `resolution=merge-duplicates`
 // has no way to say that.
 func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
-	user, err := auth.UserFrom(r.Context())
+	user, err := middleware.UserFrom(r.Context())
 	if err != nil {
 		httpx.Fail(w, r, err)
 		return
@@ -52,7 +52,7 @@ type updateMeRequest struct {
 }
 
 func (s *Server) handleUpdateMe(w http.ResponseWriter, r *http.Request) {
-	user, err := auth.UserFrom(r.Context())
+	user, err := middleware.UserFrom(r.Context())
 	if err != nil {
 		httpx.Fail(w, r, err)
 		return
@@ -120,7 +120,7 @@ func nilIfEmpty(s string) any {
 // handleListMyWorkspaces drives the post-login routing decision: no workspaces
 // means send the user to onboarding, one means jump straight into it.
 func (s *Server) handleListMyWorkspaces(w http.ResponseWriter, r *http.Request) {
-	user, err := auth.UserFrom(r.Context())
+	user, err := middleware.UserFrom(r.Context())
 	if err != nil {
 		httpx.Fail(w, r, err)
 		return
@@ -175,7 +175,7 @@ func (s *Server) handleListMyWorkspaces(w http.ResponseWriter, r *http.Request) 
 // first, then priority rank, then age) and the membership check are one query in
 // SQL and several round trips in PostgREST, so it stays an RPC.
 func (s *Server) handleMyTasks(w http.ResponseWriter, r *http.Request) {
-	user, err := auth.UserFrom(r.Context())
+	user, err := middleware.UserFrom(r.Context())
 	if err != nil {
 		httpx.Fail(w, r, err)
 		return

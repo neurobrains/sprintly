@@ -43,13 +43,13 @@ Nothing downstream will catch a mistake.
 - Every workspace-scoped query must filter on `workspace_id`. A missing filter
   is a cross-tenant data leak, not a bug that RLS will save you from.
 - Authorization belongs in `requireWorkspace` / `requireRole` /
-  `denyGuest` middleware (`internal/api/server.go`), not scattered in handlers.
+  `denyGuest` middleware (`handlers/server.go`), not scattered in handlers.
 - The RLS policies in `schema.sql` section 6 are defence in depth for a client
   that no longer reads directly. Keep them correct; don't rely on them.
 
 ### 3. There are no client-side transactions
 
-The data layer is HTTP (`internal/supa`). Multiple calls do not compose into one
+The data layer is HTTP (`db`). Multiple calls do not compose into one
 transaction. **Anything that must not half-apply belongs in a SECURITY DEFINER
 function in `supabase/schema.sql` section 8**, called via `RPC`.
 
@@ -87,7 +87,7 @@ Applying the file **twice in a row must succeed**. That is the contract.
 Two things that bite:
 
 - **RPC output column names are an API contract.** They are named to match the
-  JSON tags on the structs in `internal/models`. Renaming a column silently
+  JSON tags on the structs in `models`. Renaming a column silently
   drops a field from the API response — nothing errors.
 - **PostgREST caches the schema.** A new function is invisible until reload. The
   file ends with `notify pgrst, 'reload schema'`; the dashboard button does the
@@ -100,11 +100,11 @@ a fresh database and destroy data on an existing one. Call them out explicitly.
 
 ## Working on the backend
 
-Go 1.24, chi, no ORM. `internal/supa` is the data layer.
+Go 1.24, chi, no ORM. `db` is the data layer.
 
 - **Errors go through `httpx`.** Every response is `{ "code", "message" }` and
   `code` is stable API surface the frontend switches on. Never `http.Error`.
-- **Postgres SQLSTATEs map to HTTP in one place** — `internal/supa/errors.go`.
+- **Postgres SQLSTATEs map to HTTP in one place** — `db/errors.go`.
   Raise a deliberate errcode from an RPC rather than string-matching in Go.
 - **`RPC` vs `RPCSingle`.** `RPCSingle` sets PostgREST's object accept header,
   which asserts exactly one row — use it for `returns setof` / `returns table`

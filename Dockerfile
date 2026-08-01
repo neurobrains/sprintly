@@ -29,7 +29,7 @@ COPY backend/ ./
 
 # Static binary: distroless has no libc to link against.
 # -s -w drops the symbol table and DWARF data (~30% smaller image).
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/server ./cmd/server
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/server .
 
 # ----------------------------------------------------------------- runtime
 FROM gcr.io/distroless/static-debian12:nonroot

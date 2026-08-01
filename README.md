@@ -30,12 +30,12 @@ frontend/  Next.js 15 · TypeScript · Tailwind · TanStack Query
 **Every byte of data goes through the Go API.** The browser holds the Supabase
 URL and anon key purely to complete the Google OAuth handshake and hold a
 session; it has no data path to Postgres. Authorization lives in one place —
-`requireWorkspace` and `requireRole` in `internal/api/server.go`.
+`requireWorkspace` and `requireRole` in `handlers/server.go`.
 
 **The API talks PostgREST, not Postgres.** The deployment holds the project URL,
 the anon key and the service role key — never the database password — so there
-is no connection string and no pool. `internal/supa` is a small PostgREST client;
-`internal/api` uses it for CRUD and calls SQL functions for anything it can't
+is no connection string and no pool. `db` is a small PostgREST client;
+`handlers` uses it for CRUD and calls SQL functions for anything it can't
 express. See [CLAUDE.md](CLAUDE.md) for the rules that keeps honest.
 
 **The schema is one idempotent file.** `supabase/schema.sql` — every object is
@@ -71,7 +71,7 @@ ALLOWED_ORIGINS=http://localhost:3000
 **4. Run.**
 
 ```bash
-cd backend  && go run ./cmd/server   # :8080
+cd backend  && go run .   # :8080
 cd frontend && npm install && npm run dev   # :3000
 ```
 
@@ -83,13 +83,14 @@ cd frontend && npm install && npm run dev   # :3000
 Dockerfile                  API image (Cloud Run builds this)
 .env                        API config — the only backend env file
 backend/
-  cmd/server/main.go        entrypoint, graceful shutdown
-  internal/
-    api/                    routing, middleware, handlers
-    auth/                   Supabase JWT verification (JWKS)
-    supa/                   PostgREST client + error mapping
-    realtime/               WebSocket hub
-    models/                 wire types — JSON tags are the API contract
+  main.go                   entrypoint, graceful shutdown
+  config/                   env loading
+  db/                       PostgREST client + SQLSTATE error mapping
+  handlers/                 routing and request handlers
+  middleware/               Supabase JWT verification (JWKS), role gating
+  models/                   wire types — JSON tags are the API contract
+  httpx/                    JSON helpers, the typed error shape
+  realtime/                 WebSocket hub
 frontend/src/
   app/                      routes; w/[slug]/ is the workspace shell
   components/               board, onboarding, workspace, ui

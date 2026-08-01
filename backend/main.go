@@ -1,4 +1,4 @@
-// Command server runs the Sprintly API.
+// Command sprintly runs the Sprintly API.
 package main
 
 import (
@@ -12,10 +12,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/sprintly/sprintly/backend/internal/api"
-	"github.com/sprintly/sprintly/backend/internal/config"
-	"github.com/sprintly/sprintly/backend/internal/realtime"
-	"github.com/sprintly/sprintly/backend/internal/supa"
+	"github.com/sprintly/sprintly/backend/config"
+	"github.com/sprintly/sprintly/backend/db"
+	"github.com/sprintly/sprintly/backend/handlers"
+	"github.com/sprintly/sprintly/backend/realtime"
 )
 
 func main() {
@@ -35,7 +35,7 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	data := supa.New(cfg.SupabaseURL, cfg.SupabaseServiceKey)
+	data := db.New(cfg.SupabaseURL, cfg.SupabaseServiceKey)
 
 	// Fail fast on a bad URL or key rather than serving 502s to every caller.
 	pingCtx, cancelPing := context.WithTimeout(ctx, 10*time.Second)
@@ -48,7 +48,7 @@ func run() error {
 	hub := realtime.NewHub()
 	srv := &http.Server{
 		Addr:    ":" + cfg.Port,
-		Handler: api.NewServer(cfg, data, hub).Routes(),
+		Handler: handlers.NewServer(cfg, data, hub).Routes(),
 		// No WriteTimeout: it would sever long-lived WebSocket connections.
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
