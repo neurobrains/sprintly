@@ -226,7 +226,14 @@ func (q *Query) Delete(ctx context.Context, dest any) error {
 // Count returns how many rows match the filters, without transferring them.
 // PostgREST reports it in the Content-Range header as "0-0/<total>".
 func (q *Query) Count(ctx context.Context) (int, error) {
-	q.params.Set("select", "id")
+	// Do not name a column here. The join tables have composite primary keys and
+	// no `id` at all — workspace_members is keyed on (workspace_id, user_id) —
+	// so projecting `id` is a 42703 on exactly the tables most worth counting.
+	// PostgREST's default projection is `*`, which every table has.
+	if q.params.Get("select") == "" {
+		q.params.Set("select", "*")
+	}
+	// One row over the wire; the total comes from the header, not the body.
 	q.params.Set("limit", "1")
 	q.prefer = append(q.prefer, "count=exact")
 
