@@ -624,8 +624,13 @@ create table if not exists availability_blocks (
   check (ends_at > starts_at)
 );
 
+-- GiST over (user, period) so "is this person away during that window?" is an
+-- index scan. btree_gist is what lets a uuid sit in a GiST index alongside a
+-- range. The `WITH =` / `WITH &&` operator syntax belongs to EXCLUDE
+-- constraints, not CREATE INDEX — spelling it here is a syntax error, which is
+-- what the double-apply check in CI caught.
 create index if not exists availability_range_idx
-  on availability_blocks using gist (user_id with =, tstzrange(starts_at, ends_at) with &&);
+  on availability_blocks using gist (user_id, tstzrange(starts_at, ends_at));
 
 -- ---------------------------------------------------------------- views
 
