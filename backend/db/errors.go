@@ -26,6 +26,22 @@ func mapRESTError(status int, payload []byte) error {
 	var e restError
 	_ = json.Unmarshal(payload, &e)
 
+	// The schema is missing, not the row. PGRST202 is an absent function,
+	// PGRST205 an absent table, PGRST203 an ambiguous overload. All three mean
+	// supabase/schema.sql has not been applied — or PostgREST has not reloaded
+	// its cache since it was. Reporting these as 404 sends the caller hunting
+	// for a bad id when the real fault is the deployment, so they surface as a
+	// 500 that names the missing object.
+	switch e.Code {
+	case "PGRST202", "PGRST203", "PGRST205":
+		return &httpx.Error{
+			Status:  http.StatusInternalServerError,
+			Code:    "schema_not_applied",
+			Message: "The database schema is out of date — apply supabase/schema.sql, then reload the PostgREST schema cache.",
+			Detail:  e.Message,
+		}
+	}
+
 	// Single() asks for exactly one row; PostgREST answers 406 when the count
 	// is not 1. Zero rows is a 404 to the caller, which is what handlers written
 	// against pgx.ErrNoRows expect.
